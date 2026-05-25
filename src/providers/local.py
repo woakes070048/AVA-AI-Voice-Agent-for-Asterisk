@@ -25,6 +25,7 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
     """
     def __init__(self, config: LocalProviderConfig, on_event: Callable[[Dict[str, Any]], None]):
         super().__init__(on_event)
+        self.set_provider_identity(provider_key="local", provider_kind="local")
         self.config = config
         self.websocket: Optional[ClientConnection] = None
         # Use effective_ws_url which prefers base_url over ws_url
@@ -915,6 +916,28 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         if data.get("type") != "auth_response" or data.get("status") != "ok":
             raise RuntimeError(f"Auth rejected: {data}")
 
+    async def _close_failed_reconnect_socket(self):
+        """Close + clear self.websocket after a failed reconnect attempt.
+
+        Prevents socket leaks and stale "looks connected but no listener"
+        state when _connect_ws() succeeded but a follow-up step
+        (auth, task creation) raised. CodeRabbit critical on PR #396.
+        """
+        ws = self.websocket
+        if ws is None:
+            return
+        self.websocket = None
+        try:
+            state = getattr(ws, "state", None)
+            state_name = getattr(state, "name", "") or ""
+            if state_name == "OPEN":
+                await ws.close()
+        except Exception:
+            logger.debug(
+                "Failed closing reconnect socket after partial init",
+                exc_info=True,
+            )
+
     async def _reconnect(self):
         # Single-flight: serialize concurrent reconnect attempts so the
         # background task and _send_loop's direct on-close call don't race
@@ -926,31 +949,17 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         # If another reconnect already brought us back online, skip.
         if self.is_connected():
             return True
-        # HYBRID APPROACH: Quick port check first
-        # If port is closed, server is not running at all - skip immediately
-        # If port is open, server is starting/running - use retry logic
 
-        port_open = await self._is_port_open(timeout=0.5)
-        
-        if not port_open:
-            # Port closed = server container not running = not set up
-            logger.info(
-                "⏭️ Local AI Server port not open - skipping connection",
-                host=self._server_host,
-                port=self._server_port,
-                note="Start local-ai-server container if you want to use local STT/TTS/LLM"
-            )
-            self._server_unavailable = True
-            return False
-        
-        # Port is open - server is running, proceed with retry logic for warmup
+        # Use the WebSocket handshake as the source of truth. A separate raw TCP
+        # preflight can time out under load and incorrectly mark the server down.
         logger.info(
-            "🔄 Local AI Server port is open, connecting...",
+            "🔄 Connecting to Local AI Server...",
             host=self._server_host,
-            port=self._server_port
+            port=self._server_port,
+            connect_timeout_sec=self.connect_timeout,
         )
         self._server_unavailable = False
-        
+
         # Exponential backoff up to 30s, total ~3 minutes to cover LLM warmup (~111s)
         backoff_schedule = [2, 5, 10, 20, 30, 30, 30, 30]  # Total: ~157s
         total_elapsed = 0
@@ -994,31 +1003,65 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
                 return True
                 
             except (ConnectionRefusedError, OSError) as e:
-                # Port was open but connection failed - server might be restarting
-                # Re-check if port is still open before retrying
-                if not await self._is_port_open(timeout=0.3):
-                    logger.info(
-                        "⏭️ Local AI Server port closed during retry - stopping",
-                        note="Server may have stopped"
-                    )
-                    self._server_unavailable = True
-                    return False
-                
-                # Port still open, continue retrying
+                # Close any half-initialized socket from this attempt
+                # before retrying. If _connect_ws() succeeded but a
+                # later step failed (auth, task creation), self.websocket
+                # would otherwise point at a live but un-driven socket;
+                # is_connected()/initialize() would report healthy
+                # while no listener/sender is running, and we'd leak
+                # one socket per failed attempt (CodeRabbit critical on
+                # PR #396).
+                await self._close_failed_reconnect_socket()
+
+                # ConnectionRefused (incl. OSError errno 61 macOS / 111 Linux
+                # / 10061 Windows) is the normal symptom while the
+                # local-ai-server container is warming up — models can take
+                # ~2 minutes to load. Run the full backoff schedule
+                # (~157s) before giving up so calls placed during warmup
+                # don't fail fast. After all retries are exhausted we
+                # mark the server unavailable so subsequent calls don't
+                # spin reconnect attempts forever.
+                #
+                # Previously this branch returned False on the first
+                # ConnectionRefused, which made `initialize()` fail
+                # instantly during warmup and aborted calls that would
+                # have recovered by attempt 2-3 (Codex P1 on PR #396).
+                refused_errno = getattr(e, "errno", None)
+                is_refused = isinstance(e, ConnectionRefusedError) or refused_errno in {61, 111, 10061}
+
                 if attempt < len(backoff_schedule):
-                    logger.debug(
-                        f"Connection attempt {attempt} failed (likely warmup)",
+                    log_fn = logger.debug if is_refused else logger.debug
+                    log_fn(
+                        f"Connection attempt {attempt} failed (will retry)",
                         error=type(e).__name__,
-                        next_retry=f"{delay}s"
+                        refused=is_refused,
+                        next_retry=f"{delay}s",
                     )
                 else:
+                    if is_refused:
+                        logger.info(
+                            "⏭️ Local AI Server refused connection after all retries - provider will be inactive",
+                            host=self._server_host,
+                            port=self._server_port,
+                            attempts=len(backoff_schedule),
+                            total_elapsed=f"{total_elapsed}s",
+                            error=str(e),
+                            note="Start local-ai-server container if you want to use local STT/TTS/LLM",
+                        )
+                        self._server_unavailable = True
+                        return False
                     logger.warning(
                         "Connection failed after all retries",
                         attempts=len(backoff_schedule),
                         total_elapsed=f"{total_elapsed}s",
-                        error=str(e)
+                        error=str(e),
                     )
             except Exception as e:
+                # Same cleanup as the OSError branch — if auth or task
+                # creation raised after _connect_ws() succeeded, the
+                # socket needs explicit close + clear (CodeRabbit
+                # critical on PR #396).
+                await self._close_failed_reconnect_socket()
                 logger.warning(
                     f"Reconnect attempt {attempt} failed",
                     error=f"{type(e).__name__}: {str(e)}",
@@ -1059,23 +1102,19 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
             # Wait before checking
             await asyncio.sleep(check_interval)
             
-            # Check if port is open
-            if await self._is_port_open(timeout=1.0):
-                logger.info("🔄 Local AI Server port detected, attempting reconnect...")
-                success = await self._reconnect()
-                if success:
-                    logger.info("✅ Background reconnect successful")
-                    self._was_connected = True
-                    # Restart listener task
-                    if not self._listener_task or self._listener_task.done():
-                        self._listener_task = asyncio.create_task(self._receive_loop())
-                    break
-                else:
-                    logger.debug("Reconnect attempt failed, will retry...")
+            logger.info("🔄 Attempting Local AI Server background reconnect...")
+            success = await self._reconnect()
+            if success:
+                logger.info("✅ Background reconnect successful")
+                self._was_connected = True
+                # Restart listener task
+                if not self._listener_task or self._listener_task.done():
+                    self._listener_task = asyncio.create_task(self._receive_loop())
+                break
             else:
                 remaining = int(max_duration - elapsed)
                 logger.debug(
-                    f"Local AI Server port still closed, will check again in {check_interval}s",
+                    f"Local AI Server reconnect failed, will check again in {check_interval}s",
                     remaining=f"{remaining}s"
                 )
         

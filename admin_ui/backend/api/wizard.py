@@ -752,6 +752,7 @@ async def load_existing_config():
             "google_key": env_values.get("GOOGLE_API_KEY", ""),
             "elevenlabs_key": env_values.get("ELEVENLABS_API_KEY", ""),
             "elevenlabs_agent_id": env_values.get("ELEVENLABS_AGENT_ID", ""),
+            "xai_key": env_values.get("XAI_API_KEY", ""),
             "local_stt_backend": env_values.get("LOCAL_STT_BACKEND", "vosk"),
             "local_tts_backend": env_values.get("LOCAL_TTS_BACKEND", "piper"),
             "kroko_embedded": _parse_optional_bool(env_values.get("KROKO_EMBEDDED")) is True,
@@ -2780,31 +2781,44 @@ async def validate_api_key(validation: ApiKeyValidation):
                     else:
                         return {"valid": False, "error": f"API error: HTTP {response.status_code}"}
 
-            elif provider == "cambai":
-                # Validate CAMB AI key by performing a tiny TTS request.
-                # The /tts-stream endpoint returns 200 + audio bytes for a valid key,
-                # 401/403 for invalid keys.
-                response = await client.post(
-                    "https://client.camb.ai/apis/tts-stream",
-                    headers={
-                        "x-api-key": api_key,
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "text": "test",
-                        "voice_id": 147320,
-                        "language": "en-us",
-                        "speech_model": "mars-flash",
-                        "output_configuration": {"format": "pcm_s16le"},
-                    },
-                    timeout=15.0,
+            elif provider == "grok":
+                # xAI exposes an OpenAI-compatible /v1/models endpoint.
+                # 200 = key valid; 403 with team_blocked usually means "no credits/license yet".
+                response = await client.get(
+                    "https://api.x.ai/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=10.0,
                 )
                 if response.status_code == 200:
-                    return {"valid": True, "message": "CAMB AI API key is valid"}
-                elif response.status_code in (401, 403):
-                    return {"valid": False, "error": "Invalid API key"}
-                else:
-                    return {"valid": False, "error": f"API error: HTTP {response.status_code}"}
+                    return {"valid": True, "message": "xAI API key is valid"}
+                if response.status_code == 401:
+                    return {"valid": False, "error": "Invalid xAI API key"}
+                if response.status_code == 403:
+                    detail = ""
+                    try:
+                        body = response.json()
+                        # xAI sometimes returns {"error": {"message": "..."}} (Google-like shape)
+                        # and sometimes {"error": "string"}. Unwrap the nested message
+                        # so the UI doesn't show "Details: {'message': ...}" verbatim
+                        # (CodeRabbit on PR #396).
+                        error = body.get("error")
+                        if isinstance(error, dict):
+                            detail = error.get("message") or error.get("code") or ""
+                        elif isinstance(error, str):
+                            detail = error
+                        else:
+                            detail = body.get("message") or ""
+                    except ValueError:
+                        detail = response.text or ""
+                    return {
+                        "valid": False,
+                        "error": (
+                            "xAI rejected the key (403). Common cause: team has no credits or licenses yet — "
+                            "add credits at https://console.x.ai/."
+                            + (f" Details: {detail}" if detail else "")
+                        ),
+                    }
+                return {"valid": False, "error": f"API error: HTTP {response.status_code}"}
 
             else:
                 return {"valid": False, "error": f"Unknown provider: {provider}"}
@@ -2919,7 +2933,7 @@ class SetupConfig(BaseModel):
     elevenlabs_key: Optional[str] = None
     elevenlabs_agent_id: Optional[str] = None
     cartesia_key: Optional[str] = None
-    camb_key: Optional[str] = None
+    xai_key: Optional[str] = None
     greeting: str
     ai_name: str
     ai_role: str
@@ -2967,13 +2981,8 @@ async def save_setup_config(config: SetupConfig):
             raise HTTPException(status_code=400, detail="ElevenLabs API Key is required for ElevenLabs Conversational provider")
         if not config.elevenlabs_agent_id:
             raise HTTPException(status_code=400, detail="ElevenLabs Agent ID is required for ElevenLabs Conversational provider")
-    if config.provider == "cambai":
-        if not config.camb_key:
-            raise HTTPException(status_code=400, detail="CAMB AI API Key is required for CAMB AI provider")
-        if not config.deepgram_key:
-            raise HTTPException(status_code=400, detail="Deepgram API Key is required for CAMB AI pipeline (STT)")
-        if not config.openai_key:
-            raise HTTPException(status_code=400, detail="OpenAI API Key is required for CAMB AI pipeline (LLM)")
+    if config.provider == "grok" and not config.xai_key:
+        raise HTTPException(status_code=400, detail="xAI API Key is required for Grok Voice Agent provider")
 
     try:
         import shutil
@@ -3015,8 +3024,8 @@ async def save_setup_config(config: SetupConfig):
             env_updates["ELEVENLABS_AGENT_ID"] = config.elevenlabs_agent_id
         if config.cartesia_key:
             env_updates["CARTESIA_API_KEY"] = config.cartesia_key
-        if config.camb_key:
-            env_updates["CAMB_API_KEY"] = config.camb_key
+        if config.xai_key:
+            env_updates["XAI_API_KEY"] = config.xai_key
 
         if config.provider in ("local", "local_hybrid"):
             catalog = get_full_catalog()
@@ -3168,7 +3177,7 @@ async def save_setup_config(config: SetupConfig):
                     )
             
             # Full agent providers - clear active_pipeline when setting as default
-            if config.provider in ["openai_realtime", "deepgram", "google_live", "elevenlabs_agent", "local"]:
+            if config.provider in ["openai_realtime", "deepgram", "google_live", "elevenlabs_agent", "local", "grok"]:
                 yaml_config["default_provider"] = config.provider
                 yaml_config["active_pipeline"] = None  # Full agents don't use pipelines
             
@@ -3245,6 +3254,38 @@ async def save_setup_config(config: SetupConfig):
                         "target_encoding": "ulaw",
                         "target_sample_rate_hz": 8000
                     })
+
+            elif config.provider == "grok":
+                providers.setdefault("grok", {})["enabled"] = True
+                if not provider_exists("grok"):
+                    providers["grok"].update({
+                        "type": "grok",
+                        "api_key": "${XAI_API_KEY}",
+                        "base_url": "wss://api.x.ai/v1/realtime",
+                        "model": "grok-voice-latest",
+                        "voice": "eve",
+                        "capabilities": ["stt", "llm", "tts"],
+                        # Audio: μ-law in / PCM16-24k out (xAI emits 24 kHz PCM16 regardless of
+                        # output_format declaration). See docs/Provider-Grok-Setup.md.
+                        "input_encoding": "ulaw",
+                        "input_sample_rate_hz": 8000,
+                        "provider_input_encoding": "ulaw",
+                        "provider_input_sample_rate_hz": 8000,
+                        "output_encoding": "linear16",
+                        "output_sample_rate_hz": 24000,
+                        "target_encoding": "ulaw",
+                        "target_sample_rate_hz": 8000,
+                        "response_modalities": ["audio", "text"],
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "silence_duration_ms": 1000,
+                            "prefix_padding_ms": 300,
+                        },
+                        "session_warn_after_seconds": 1680,  # 28 min (30-min xAI hard cap)
+                    })
+                providers["grok"]["greeting"] = config.greeting
+                providers["grok"]["instructions"] = f"You are {config.ai_name}, a {config.ai_role}. Be helpful and concise. Always speak your responses out loud."
 
             elif config.provider == "local":
                 providers.setdefault("local", {})["enabled"] = True
@@ -3341,52 +3382,6 @@ async def save_setup_config(config: SetupConfig):
                     "stt": "local_stt",
                     "llm": llm_component,
                     "tts": "local_tts"
-                }
-
-            elif config.provider == "cambai":
-                # CAMB AI is a TTS-only provider, so it runs as a PIPELINE:
-                # Deepgram STT + OpenAI LLM + CAMB AI TTS
-                pipeline_name = "cambai_pipeline"
-                yaml_config["active_pipeline"] = pipeline_name
-                yaml_config["default_provider"] = pipeline_name
-
-                # Configure CAMB AI TTS provider
-                providers.setdefault("cambai", {})["enabled"] = True
-                if not provider_exists("cambai"):
-                    providers["cambai"].update({
-                        "voice_id": 147320,
-                        "speech_model": "mars-flash",
-                        "language": "en-us",
-                        "output_format": "pcm_s16le",
-                    })
-
-                # Configure Deepgram STT pipeline adapter
-                providers.setdefault("deepgram_stt", {})["enabled"] = True
-                if not provider_exists("deepgram_stt"):
-                    providers["deepgram_stt"].update({
-                        "api_key": "${DEEPGRAM_API_KEY}",
-                        "model": "nova-2-general",
-                        "stt_language": "en-US",
-                        "input_encoding": "linear16",
-                        "input_sample_rate_hz": 8000,
-                    })
-
-                # Configure OpenAI LLM pipeline adapter
-                providers.setdefault("openai_llm", {})["enabled"] = True
-                if not provider_exists("openai_llm"):
-                    providers["openai_llm"].update({
-                        "api_key": "${OPENAI_API_KEY}",
-                        "chat_base_url": "https://api.openai.com/v1",
-                        "chat_model": "gpt-4o-mini",
-                        "type": "openai",
-                        "capabilities": ["llm"],
-                    })
-
-                # Define the pipeline
-                yaml_config.setdefault("pipelines", {})[pipeline_name] = {
-                    "stt": "deepgram_stt",
-                    "llm": "openai_llm",
-                    "tts": "cambai_tts"
                 }
 
             # C6 Fix: Create default context

@@ -4,6 +4,7 @@ import { toast } from 'sonner';
 import { useConfirmDialog } from '../../../hooks/useConfirmDialog';
 import { AlertTriangle, Upload, Trash2, CheckCircle, XCircle, Loader2, FileJson } from 'lucide-react';
 import HelpTooltip from '../../ui/HelpTooltip';
+import ProviderCredentialsCard, { applyCredentialPatch } from './ProviderCredentialsCard';
 import {
     GOOGLE_LIVE_MODEL_GROUPS,
     GOOGLE_LIVE_SUPPORTED_MODELS,
@@ -62,9 +63,10 @@ interface CredentialsStatus {
 interface GoogleLiveProviderFormProps {
     config: any;
     onChange: (newConfig: any) => void;
+    providerKey?: string;
 }
 
-const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config, onChange }) => {
+const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config, onChange, providerKey }) => {
     const { confirm } = useConfirmDialog();
     const handleChange = (field: string, value: any) => {
         onChange({ ...config, [field]: value });
@@ -87,24 +89,27 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
     const [verifyResult, setVerifyResult] = useState<{ status: 'success' | 'error'; message: string } | null>(null);
     const [uploadError, setUploadError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const providerCredentialsBase = providerKey
+        ? `/api/config/providers/${encodeURIComponent(providerKey)}/credentials`
+        : '/api/config/vertex-ai';
 
     // Fetch regions and credentials status
     const fetchVertexData = useCallback(async () => {
         try {
             const [regionsRes, credsRes] = await Promise.all([
                 axios.get('/api/config/vertex-ai/regions'),
-                axios.get('/api/config/vertex-ai/credentials'),
+                axios.get(providerKey ? providerCredentialsBase : `${providerCredentialsBase}/credentials`),
             ]);
             if (regionsRes.data) {
                 setRegions(regionsRes.data.regions || []);
             }
             if (credsRes.data) {
-                setCredentials(credsRes.data);
+                setCredentials(providerKey ? (credsRes.data.credentials?.['vertex-json'] || { uploaded: false }) : credsRes.data);
             }
         } catch (e) {
             console.error('Failed to fetch Vertex AI data:', e);
         }
-    }, []);
+    }, [providerKey, providerCredentialsBase]);
 
     useEffect(() => {
         fetchVertexData();
@@ -154,7 +159,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         formData.append('file', file);
 
         try {
-            const res = await axios.post('/api/config/vertex-ai/credentials', formData, {
+            const res = await axios.post(providerKey ? `${providerCredentialsBase}/vertex-json` : `${providerCredentialsBase}/credentials`, formData, {
                 headers: { 'Content-Type': 'multipart/form-data' },
             });
             await fetchVertexData();
@@ -181,7 +186,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         if (!confirmed) return;
 
         try {
-            await axios.delete('/api/config/vertex-ai/credentials');
+            await axios.delete(providerKey ? `${providerCredentialsBase}/vertex-json` : `${providerCredentialsBase}/credentials`);
             setCredentials({ uploaded: false, filename: null, project_id: null, client_email: null, uploaded_at: null });
             setVerifyResult(null);
             toast.success('Service account credentials deleted');
@@ -196,7 +201,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         setVerifyResult(null);
 
         try {
-            const res = await axios.post('/api/config/vertex-ai/verify');
+            const res = await axios.post(providerKey ? `${providerCredentialsBase}/verify` : `${providerCredentialsBase}/verify`);
             setVerifyResult({ status: 'success', message: res.data.message || 'Credentials verified!' });
             // Auto-switch to a Vertex-compatible model on successful verification
             const currentModel = config.llm_model || '';
@@ -228,9 +233,25 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             }}
                         />
                         <div>
-                            <label htmlFor="use_vertex_ai" className="text-sm font-medium cursor-pointer">
-                                Use Vertex AI (Enterprise / GCP)
-                            </label>
+                            <div className="flex items-center gap-1.5">
+                                <label htmlFor="use_vertex_ai" className="text-sm font-medium cursor-pointer">
+                                    Use Vertex AI (Enterprise / GCP)
+                                </label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>API Mode toggle</strong> — choose between Google's two Live API surfaces.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>Off (Developer API):</strong> <code>generativelanguage.googleapis.com</code> with a simple <code>GOOGLE_API_KEY</code>. Fastest setup; preview models.</li>
+                                                <li><strong>On (Vertex AI):</strong> <code>aiplatform.googleapis.com</code> with OAuth2/ADC via service-account JSON. GA models, enterprise quotas, fixed function-calling reliability.</li>
+                                            </ul>
+                                            Toggling auto-switches the model to the matching API group.
+                                        </>
+                                    }
+                                    link="https://ai.google.dev/gemini-api/docs/live"
+                                    linkText="Gemini Live docs"
+                                />
+                            </div>
                             <p className="text-xs text-muted-foreground mt-0.5">
                                 Connects to <code>aiplatform.googleapis.com</code> using OAuth2/ADC instead of an API key.
                                 Enables GA models with fixed function calling reliability.
@@ -244,7 +265,23 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             {/* Service Account JSON Upload */}
                             <div className="space-y-3">
                                 <div className="flex items-center justify-between">
-                                    <label className="text-sm font-medium">Service Account JSON</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">Service Account JSON</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>GCP Service Account key</strong> — required when Use Vertex AI is enabled. Stored per-instance as <code>GOOGLE_APPLICATION_CREDENTIALS</code>.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Create via GCP Console → IAM &amp; Admin → Service Accounts → Keys → Add key (JSON)</li>
+                                                        <li>Required IAM role: <code>roles/aiplatform.user</code></li>
+                                                        <li>Use the Verify button after upload to confirm Vertex AI access</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://cloud.google.com/iam/docs/service-account-overview"
+                                            linkText="Service accounts"
+                                        />
+                                    </div>
                                     {credentials?.uploaded && (
                                         <button
                                             type="button"
@@ -318,7 +355,23 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             {/* Project ID and Region */}
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">GCP Project ID</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">GCP Project ID</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>GCP Project ID</strong> — the project where Vertex AI is enabled and billing is attached.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Auto-filled from the uploaded service-account JSON when this field is empty</li>
+                                                        <li>Run <code>gcloud projects list</code> or check GCP Console → Dashboard</li>
+                                                        <li>Vertex AI API must be enabled on this project</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://cloud.google.com/resource-manager/docs/creating-managing-projects"
+                                            linkText="GCP projects"
+                                        />
+                                    </div>
                                     <input
                                         type="text"
                                         className="w-full p-2 rounded border border-input bg-background"
@@ -329,7 +382,23 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                     <p className="text-xs text-muted-foreground">Auto-filled from JSON if empty</p>
                                 </div>
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">GCP Region</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">GCP Region</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>Vertex AI region</strong> — which GCP region serves the Live API endpoint.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li><code>us-central1</code> (Iowa) is the default and has the widest model availability</li>
+                                                        <li>Pick the region closest to your Asterisk PBX for lower round-trip latency</li>
+                                                        <li>Some preview models are only available in <code>us-central1</code></li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations"
+                                            linkText="Vertex AI locations"
+                                        />
+                                    </div>
                                     <select
                                         className="w-full p-2 rounded border border-input bg-background"
                                         value={config.vertex_location || 'us-central1'}
@@ -358,15 +427,62 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
 
                     {/* Developer API key — shown when Vertex AI is OFF */}
                     {!config.use_vertex_ai && (
-                        <div className="space-y-2">
-                            <label className="text-sm font-medium">API Key (Environment Variable)</label>
-                            <input
-                                type="text"
-                                className="w-full p-2 rounded border border-input bg-background"
-                                value={config.api_key || '${GOOGLE_API_KEY}'}
-                                onChange={(e) => handleChange('api_key', e.target.value)}
-                                placeholder="${GOOGLE_API_KEY}"
+                        <div className="space-y-3">
+                            <ProviderCredentialsCard
+                                providerKey={providerKey}
+                                credentialType="api-key"
+                                label="Google API Key"
+                                placeholder="AIza..."
+                                envVarFallback="GOOGLE_API_KEY"
+                                inlineValue={config.api_key}
+                                onConfigPatch={(patch) => applyCredentialPatch(patch, onChange)}
+                                helpText={
+                                    <>
+                                        Get a key from{' '}
+                                        <a
+                                            href="https://aistudio.google.com/apikey"
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="text-primary hover:underline"
+                                        >
+                                            Google AI Studio
+                                        </a>
+                                        . Per-instance keys override the env var fallback.
+                                    </>
+                                }
                             />
+                            <div className="space-y-2">
+                                <div className="flex items-center gap-1.5">
+                                    <label className="text-sm font-medium text-muted-foreground">
+                                        API Key (inline / env var) — legacy
+                                    </label>
+                                    <HelpTooltip
+                                        content={
+                                            <>
+                                                <strong>Legacy API key field</strong> — kept for back-compat with older configs.
+                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                    <li>Prefer the upload widget above (per-instance, encrypted at rest)</li>
+                                                    <li>Accepts a raw key or an env reference like <code>${'${'}GOOGLE_API_KEY{'}'}</code></li>
+                                                    <li>Get a Developer API key from Google AI Studio</li>
+                                                </ul>
+                                            </>
+                                        }
+                                        link="https://aistudio.google.com/apikey"
+                                        linkText="Google AI Studio"
+                                    />
+                                </div>
+                                <input
+                                    type="text"
+                                    className="w-full p-2 rounded border border-input bg-background"
+                                    value={config.api_key || ''}
+                                    onChange={(e) => handleChange('api_key', e.target.value)}
+                                    placeholder="${GOOGLE_API_KEY}"
+                                />
+                                <p className="text-xs text-muted-foreground">
+                                    Direct value or <code>${'{'}GOOGLE_API_KEY{'}'}</code> reference. Per-instance uploads above
+                                    take precedence over this field.
+                                </p>
+                            </div>
                         </div>
                     )}
                 </div>
@@ -377,10 +493,26 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
             <div>
                 <h4 className="font-semibold mb-3">API Endpoint</h4>
                 <div className="space-y-2">
-                    <label className="text-sm font-medium">
-                        WebSocket Endpoint
-                        <span className="text-xs text-muted-foreground ml-2">(websocket_endpoint)</span>
-                    </label>
+                    <div className="flex items-center gap-1.5">
+                        <label className="text-sm font-medium">
+                            WebSocket Endpoint
+                            <span className="text-xs text-muted-foreground ml-2">(websocket_endpoint)</span>
+                        </label>
+                        <HelpTooltip
+                            content={
+                                <>
+                                    <strong>Gemini Live WebSocket URL</strong> — the bidirectional streaming endpoint for the Developer API.
+                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                        <li>Default points at <code>v1beta</code> BidiGenerateContent — required for current Live models</li>
+                                        <li>Only edit if Google publishes a stable <code>v1</code> Live WS path or you're routing through a proxy</li>
+                                        <li>Ignored when Use Vertex AI is enabled (Vertex builds its endpoint from project + region)</li>
+                                    </ul>
+                                </>
+                            }
+                            link="https://ai.google.dev/api/multimodal-live"
+                            linkText="Live WS API"
+                        />
+                    </div>
                     <input
                         type="text"
                         className="w-full p-2 rounded border border-input bg-background"
@@ -400,7 +532,23 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                 <h4 className="font-semibold mb-3">Models & Voice</h4>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="space-y-2">
-                        <label className="text-sm font-medium">LLM Model</label>
+                        <div className="flex items-center gap-1.5">
+                            <label className="text-sm font-medium">LLM Model</label>
+                            <HelpTooltip
+                                content={
+                                    <>
+                                        <strong>Gemini Live model</strong> — pricing ~1.5¢/min, sub-second response latency, 24+ language coverage.
+                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                            <li><code>gemini-live-2.5-flash-native-audio</code> — Vertex AI GA, recommended for production</li>
+                                            <li><code>gemini-2.5-flash-preview-native-audio-dialog</code> — Developer API preview with native-audio dialog tuning</li>
+                                            <li>Models are scoped to their API group — switching Use Vertex AI auto-swaps to a compatible model</li>
+                                        </ul>
+                                    </>
+                                }
+                                link="https://ai.google.dev/gemini-api/docs/live-guide"
+                                linkText="Live model guide"
+                            />
+                        </div>
                         <select
                             className="w-full p-2 rounded border border-input bg-background"
                             value={selectedModel}
@@ -438,7 +586,23 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                         </p>
                     </div>
                     <div className="space-y-2">
-                        <label className="text-sm font-medium">TTS Voice Name</label>
+                        <div className="flex items-center gap-1.5">
+                            <label className="text-sm font-medium">TTS Voice Name</label>
+                            <HelpTooltip
+                                content={
+                                    <>
+                                        <strong>Gemini Live voice</strong> — 30 named voices, each with a tonal descriptor (e.g. Aoede=Breezy, Kore=Firm, Charon=Informative, Sulafat=Warm).
+                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                            <li>All voices are multilingual — they auto-switch across 70+ languages with no configuration</li>
+                                            <li>Tone is a quick personality hint; preview in AI Studio before committing</li>
+                                            <li>Picking <strong>Aoede</strong> or <strong>Kore</strong> is a safe default for support-agent personas</li>
+                                        </ul>
+                                    </>
+                                }
+                                link="https://ai.google.dev/gemini-api/docs/speech-generation"
+                                linkText="Speech generation"
+                            />
+                        </div>
                         <select
                             className="w-full p-2 rounded border border-input bg-background"
                             value={config.tts_voice_name || 'Aoede'}
@@ -461,7 +625,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                         </p>
                     </div>
                     <div className="space-y-2">
-                        <label className="text-sm font-medium">Temperature</label>
+                        <div className="flex items-center gap-1.5">
+                            <label className="text-sm font-medium">Temperature</label>
+                            <HelpTooltip
+                                content={
+                                    <>
+                                        <strong>Sampling temperature</strong> (0.0–2.0) — randomness of model output.
+                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                            <li><strong>0.0–0.3:</strong> deterministic, good for scripted IVR / structured tool calls</li>
+                                            <li><strong>0.7</strong> (default): balanced conversational tone</li>
+                                            <li><strong>1.0+:</strong> more creative; avoid for transactional flows where consistency matters</li>
+                                        </ul>
+                                    </>
+                                }
+                            />
+                        </div>
                         <input
                             type="number"
                             step="0.1"
@@ -474,7 +652,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                         </p>
                     </div>
                     <div className="space-y-2">
-                        <label className="text-sm font-medium">Max Output Tokens</label>
+                        <div className="flex items-center gap-1.5">
+                            <label className="text-sm font-medium">Max Output Tokens</label>
+                            <HelpTooltip
+                                content={
+                                    <>
+                                        <strong>Per-turn output cap</strong> — maximum tokens the model may produce in a single response.
+                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                            <li>8192 (default) is generous for phone-call turns; most voice replies stay well under 200 tokens</li>
+                                            <li>Lower it (e.g. 512) to discourage rambling responses and reduce time-to-first-audio jitter</li>
+                                            <li>Hitting this cap mid-sentence truncates the reply — keep headroom</li>
+                                        </ul>
+                                    </>
+                                }
+                            />
+                        </div>
                         <input
                             type="number"
                             className="w-full p-2 rounded border border-input bg-background"
@@ -491,7 +683,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                     <h4 className="font-semibold text-sm border-b pb-2">Advanced Sampling</h4>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Top P</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Top P</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Nucleus sampling</strong> (0.0–1.0) — restricts sampling to the smallest set of tokens whose cumulative probability exceeds P.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>0.95 (default) is balanced; lower values constrain the vocabulary further</li>
+                                                <li>Usually tune temperature OR top_p, not both</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 step="0.01"
@@ -504,7 +709,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Top K</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Top K</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Top-K sampling</strong> — at each step, sample only from the K most likely next tokens.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>40 (default) is a reasonable balance for conversational use</li>
+                                                <li>Lower values = more focused / deterministic; higher = more diverse</li>
+                                                <li>Combined with top_p — the more restrictive of the two wins</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
@@ -522,7 +741,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                     <h4 className="font-semibold text-sm border-b pb-2">Audio Configuration</h4>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Input Encoding</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Input Encoding</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Codec coming FROM Asterisk</strong> — the raw audio format AudioSocket delivers to AAVA.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>μ-law</strong> (ulaw) — standard PSTN / SIP telephony; matches most chan_pjsip setups</li>
+                                                <li><strong>pcm16 / linear16</strong> — uncompressed 16-bit PCM if Asterisk transcodes upstream</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <select
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.input_encoding || 'ulaw'}
@@ -537,7 +769,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Input Sample Rate (Hz)</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Input Sample Rate (Hz)</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Sample rate FROM Asterisk</strong>.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>8000 Hz</strong> — standard telephony (narrowband)</li>
+                                                <li><strong>16000 Hz</strong> — wideband (G.722, Opus); only if your dialplan transcodes</li>
+                                                <li>Must match what Asterisk actually emits — mismatch causes chipmunk / slow-talk artifacts</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
@@ -549,7 +795,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Output Encoding</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Output Encoding</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Codec returned BY Google</strong> — the raw TTS format on the wire from the Live API.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>linear16</strong> — what Gemini natively returns; best quality</li>
+                                                <li>μ-law / pcm16 only if you're routing through a transcoding proxy</li>
+                                                <li>Will be re-encoded to <strong>Target Encoding</strong> before being sent to Asterisk</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <select
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.output_encoding || 'linear16'}
@@ -564,7 +824,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Output Sample Rate (Hz)</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Output Sample Rate (Hz)</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Sample rate Google emits</strong>.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>24000 Hz</strong> — Gemini's native TTS rate; do not change unless you know the model emits otherwise</li>
+                                                <li>AAVA resamples 24k → 8k for telephony before playback</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
@@ -576,7 +849,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                         <div className="space-y-2">
-                        <label className="text-sm font-medium">Target Encoding</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Target Encoding</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Codec sent TO Asterisk</strong> — final playback format after AAVA transcodes Gemini's audio.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>μ-law</strong> — match your Asterisk channel's negotiated codec (PSTN default)</li>
+                                                <li>Mismatch with Asterisk = no audio or garbled playback</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <select
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.target_encoding || 'ulaw'}
@@ -591,7 +877,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Target Sample Rate (Hz)</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Target Sample Rate (Hz)</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Sample rate sent TO Asterisk</strong> for playback.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>8000 Hz</strong> — standard PSTN telephony; pair with μ-law target encoding</li>
+                                                <li><strong>16000 Hz</strong> — wideband (Opus/G.722) channels only</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
@@ -603,7 +902,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Provider Input Encoding</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Provider Input Encoding</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Codec sent TO Google</strong> — what AAVA re-encodes the caller's voice into before streaming to Gemini.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>linear16</strong> — required by Gemini Live; do not change</li>
+                                                <li>pcm16 is the same byte format under a different name</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <select
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.provider_input_encoding || 'linear16'}
@@ -617,7 +929,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Provider Input Sample Rate (Hz)</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Provider Input Sample Rate (Hz)</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Sample rate sent TO Google</strong>.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>16000 Hz</strong> — optimal for Gemini Live STT accuracy; AAVA upsamples 8k → 16k automatically</li>
+                                                <li>Don't go below 16000 — quality drops noticeably</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
@@ -635,7 +960,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                     <h4 className="font-semibold text-sm border-b pb-2">Transcription & Modalities</h4>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Greeting</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Greeting</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>First-utterance greeting</strong> — spoken (or sent as text) immediately when the call connects, before the user speaks.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Leave blank to let the system prompt drive the opener</li>
+                                                <li>Short greetings reduce time-to-first-audio and feel snappier</li>
+                                                <li>Will be voiced by the selected TTS voice in 1-1.5s</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="text"
                                 className="w-full p-2 rounded border border-input bg-background"
@@ -645,7 +984,23 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             />
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Response Modalities</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Response Modalities</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Which modalities Gemini returns</strong> on each turn.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><strong>Audio Only</strong> (default for voice) — TTS is generated server-side</li>
+                                                <li><strong>Text Only</strong> — no TTS; useful for chat-style integrations or external TTS pipelines</li>
+                                                <li><strong>Audio &amp; Text</strong> — both streams; enables real-time transcript display alongside playback</li>
+                                            </ul>
+                                        </>
+                                    }
+                                    link="https://ai.google.dev/api/multimodal-live"
+                                    linkText="Modalities"
+                                />
+                            </div>
                             <select
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.response_modalities || 'audio'}
@@ -664,7 +1019,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 checked={config.enable_input_transcription ?? true}
                                 onChange={(e) => handleChange('enable_input_transcription', e.target.checked)}
                             />
-                            <label htmlFor="enable_input_transcription" className="text-sm font-medium">Enable Input Transcription</label>
+                            <div className="flex items-center gap-1.5">
+                                <label htmlFor="enable_input_transcription" className="text-sm font-medium">Enable Input Transcription</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Caller-side STT transcription</strong> — when on, Gemini returns a text transcript of what the user said.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Required for call logs, post-call analytics, and tool calls that depend on user text</li>
+                                                <li>Adds minor token cost but is generally cheap</li>
+                                                <li>Recommended <strong>on</strong> for production</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                         </div>
                         <div className="flex items-center space-x-2">
                             <input
@@ -674,7 +1043,20 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 checked={config.enable_output_transcription ?? true}
                                 onChange={(e) => handleChange('enable_output_transcription', e.target.checked)}
                             />
-                            <label htmlFor="enable_output_transcription" className="text-sm font-medium">Enable Output Transcription</label>
+                            <div className="flex items-center gap-1.5">
+                                <label htmlFor="enable_output_transcription" className="text-sm font-medium">Enable Output Transcription</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Assistant-side TTS transcription</strong> — text of what the model just spoke.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Useful for transcript pairing, supervisor review, and barge-in handling</li>
+                                                <li>Recommended <strong>on</strong> — required by some downstream tool-call heuristics</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                         </div>
                         <div className="flex items-center space-x-2">
                             <input
@@ -684,10 +1066,37 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 checked={config.enabled ?? true}
                                 onChange={(e) => handleChange('enabled', e.target.checked)}
                             />
-                            <label htmlFor="enabled" className="text-sm font-medium">Enabled</label>
+                            <div className="flex items-center gap-1.5">
+                                <label htmlFor="enabled" className="text-sm font-medium">Enabled</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Provider enabled flag</strong> — gates whether this provider instance can be selected as the active AI engine.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Disabled providers are hidden from the active-provider dropdown</li>
+                                                <li>Does not delete config — toggle back on at any time</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Input Gain Target RMS</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Input Gain Target RMS</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Target RMS level</strong> for inbound caller audio (linear PCM amplitude, 0–32767 scale).
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>0 disables AGC — audio is forwarded unchanged</li>
+                                                <li>Use only if you see chronically quiet callers (e.g. soft-talkers, distant mic)</li>
+                                                <li>Typical values around 3000–5000; pair with Input Gain Max dB to bound boost</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
@@ -697,7 +1106,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             <p className="text-xs text-muted-foreground">Optional normalization target for inbound audio.</p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Input Gain Max dB</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Input Gain Max dB</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Maximum boost (dB)</strong> the AGC may apply when normalizing toward the target RMS.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>0 disables boost (no normalization)</li>
+                                                <li>6–12 dB is a safe range for quiet callers; higher amplifies background hiss</li>
+                                                <li>Only effective when Input Gain Target RMS &gt; 0</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
@@ -707,7 +1130,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             <p className="text-xs text-muted-foreground">Optional max gain applied during normalization.</p>
                         </div>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Farewell Hangup Delay (seconds)</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Farewell Hangup Delay (seconds)</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Grace period after farewell audio</strong> finishes playing before AAVA actually hangs up the SIP channel.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Prevents Asterisk from cutting off the last syllable of "Goodbye."</li>
+                                                <li>Leave blank to inherit the global default (2.5s)</li>
+                                                <li>Set to 0 only if you control exactly when audio ends</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="number"
                                 step="0.5"
@@ -737,7 +1174,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 checked={config.hangup_markers_enabled ?? false}
                                 onChange={(e) => handleChange('hangup_markers_enabled', e.target.checked)}
                             />
-                            <label htmlFor="hangup_markers_enabled" className="text-sm font-medium">Enable Marker-Based Hangup Heuristics</label>
+                            <div className="flex items-center gap-1.5">
+                                <label htmlFor="hangup_markers_enabled" className="text-sm font-medium">Enable Marker-Based Hangup Heuristics</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Transcript-marker fallback</strong> — scans the output transcript for farewell phrases (e.g. "end_call", "assistant_farewell") to arm <code>cleanup_after_tts</code> when no <code>hangup_call</code> tool fires.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Recommended <strong>off</strong> for production — rely on the explicit <code>hangup_call</code> tool</li>
+                                                <li>Only enable while debugging cases where Gemini drops turnComplete after a farewell</li>
+                                                <li>Can produce false-positive hangups if the bot uses farewell wording mid-call</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                         </div>
                         <p className="text-xs text-muted-foreground">
                             Advanced: uses transcript marker matching (end_call / assistant_farewell) to arm <code>cleanup_after_tts</code> when a toolCall is missing.

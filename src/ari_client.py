@@ -432,12 +432,15 @@ class ARIClient:
     async def hangup_channel(self, channel_id: str):
         """Hang up a channel."""
         logger.info("Hanging up channel", channel_id=channel_id)
-        # We add a check here. If the command fails with a 404, we log it
-        # as a debug message instead of an error, as this can happen in race
-        # conditions during cleanup and is not necessarily a critical failure.
+        # A 404 here is the normal post-StasisEnd race: caller disconnected first,
+        # Asterisk destroyed the channel, and our cleanup hangup arrives a beat later.
+        # Not a failure — log neutrally so it doesn't read as an error in RCAs.
         response = await self.send_command("DELETE", f"channels/{channel_id}", tolerate_statuses=[404])
         if response and response.get("status") == 404:
-            logger.debug("Channel hangup failed (404), likely already hung up.", channel_id=channel_id)
+            logger.debug(
+                "Hangup no-op: channel already destroyed (expected post-StasisEnd race)",
+                channel_id=channel_id,
+            )
 
     async def execute_application(self, channel_id: str, app_name: str, app_data: str) -> bool:
         """Execute an Asterisk application on a channel."""

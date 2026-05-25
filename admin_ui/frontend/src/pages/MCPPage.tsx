@@ -520,6 +520,7 @@ const MCPPage = () => {
                             value={serverForm.cwd || ''}
                             onChange={(e) => setServerForm({ ...serverForm, cwd: e.target.value })}
                             placeholder="/app/mcp_servers/weather"
+                            tooltip="Working directory for the spawned MCP process. Leave blank to inherit the AI Engine's CWD."
                         />
 
                         <div className="space-y-3">
@@ -532,18 +533,21 @@ const MCPPage = () => {
                                     value={String(serverForm.defaults.timeout_ms)}
                                     onChange={(e) => setServerForm({ ...serverForm, defaults: { ...serverForm.defaults, timeout_ms: Number(e.target.value || 0) } })}
                                     placeholder="10000"
+                                    tooltip="Hard upper bound for a single tool call before it's cancelled and an error is returned to the LLM."
                                 />
                                 <FormInput
                                     label="Slow Threshold (ms)"
                                     value={String(serverForm.defaults.slow_response_threshold_ms)}
                                     onChange={(e) => setServerForm({ ...serverForm, defaults: { ...serverForm.defaults, slow_response_threshold_ms: Number(e.target.value || 0) } })}
                                     placeholder="0"
+                                    tooltip="If a tool call takes longer than this, the agent speaks the 'slow message' to keep the caller engaged. 0 disables."
                                 />
                                 <FormInput
                                     label="Slow Message"
                                     value={serverForm.defaults.slow_response_message}
                                     onChange={(e) => setServerForm({ ...serverForm, defaults: { ...serverForm.defaults, slow_response_message: e.target.value } })}
                                     placeholder="Let me look that up for you, one moment..."
+                                    tooltip="Filler spoken to the caller when a tool call exceeds the slow threshold. Keep it short and natural."
                                 />
                             </div>
                         </div>
@@ -570,12 +574,14 @@ const MCPPage = () => {
                                     value={String(serverForm.restart.max_restarts)}
                                     onChange={(e) => setServerForm({ ...serverForm, restart: { ...serverForm.restart, max_restarts: Number(e.target.value || 0) } })}
                                     placeholder="5"
+                                    tooltip="Total restart attempts before the supervisor gives up and marks the server unavailable."
                                 />
                                 <FormInput
                                     label="Backoff (ms)"
                                     value={String(serverForm.restart.backoff_ms)}
                                     onChange={(e) => setServerForm({ ...serverForm, restart: { ...serverForm.restart, backoff_ms: Number(e.target.value || 0) } })}
                                     placeholder="1000"
+                                    tooltip="Delay between restart attempts. Doubles on consecutive failures (exponential backoff)."
                                 />
                             </div>
                         </div>
@@ -659,6 +665,7 @@ const MCPPage = () => {
                                                     setServerForm({ ...serverForm, tools: next });
                                                 }}
                                                 placeholder="get_weather_by_city"
+                                                tooltip="The MCP tool name as discovered from the server (matches the server's tools/list output exactly)."
                                             />
                                             <FormInput
                                                 label="Expose As (optional)"
@@ -682,6 +689,7 @@ const MCPPage = () => {
                                                     setServerForm({ ...serverForm, tools: next });
                                                 }}
                                                 placeholder="atis_text"
+                                                tooltip="Field from the tool's JSON response that the agent should speak verbatim. Skips LLM summarization of that field."
                                             />
                                             <FormInput
                                                 label="Speech Template (optional)"
@@ -692,6 +700,7 @@ const MCPPage = () => {
                                                     setServerForm({ ...serverForm, tools: next });
                                                 }}
                                                 placeholder="The ATIS for {icao} is {atis_text}"
+                                                tooltip="Template for the spoken reply. {field} placeholders are filled from the tool's response JSON."
                                             />
                                         </div>
                                     </div>

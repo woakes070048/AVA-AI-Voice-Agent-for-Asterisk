@@ -20,6 +20,7 @@ import AudioSocketConfig from '../components/config/AudioSocketConfig';
 import DeepgramProviderForm from '../components/config/providers/DeepgramProviderForm';
 import OpenAIRealtimeProviderForm from '../components/config/providers/OpenAIRealtimeProviderForm';
 import GoogleLiveProviderForm from '../components/config/providers/GoogleLiveProviderForm';
+import GrokProviderForm from '../components/config/providers/GrokProviderForm';
 import LocalProviderForm from '../components/config/providers/LocalProviderForm';
 import OpenAIProviderForm from '../components/config/providers/OpenAIProviderForm';
 import ElevenLabsProviderForm from '../components/config/providers/ElevenLabsProviderForm';
@@ -274,7 +275,25 @@ const ConfigEditor = () => {
 
     const renderProviderForm = () => {
         // Helper to update provider form state
-        const updateForm = (newValues: any) => setProviderForm({ ...providerForm, ...newValues });
+        // Functional setState so async callbacks (e.g. credential uploads
+        // resolving after the user has edited other fields) don't merge against
+        // a stale `providerForm` captured at render time.
+        //
+        // Delete semantics: a key set to `undefined` in `newValues` is treated
+        // as "remove this key from the form state". This is how the credential
+        // card signals deletion of `api_key_file` / `agent_id_file` after the
+        // user clicks Delete — without this, a shallow merge would preserve
+        // the prior path and a later form Save would write that stale
+        // reference back to YAML. (Reported in PR #395 review.)
+        const updateForm = (newValues: any) =>
+            setProviderForm((prev: any) => {
+                const next: any = { ...prev };
+                for (const [k, v] of Object.entries(newValues)) {
+                    if (v === undefined) delete next[k];
+                    else next[k] = v;
+                }
+                return next;
+            });
 
         // Common fields (Name)
         const commonFields = (
@@ -304,6 +323,7 @@ const ConfigEditor = () => {
                             <option value="elevenlabs">ElevenLabs TTS / Agent</option>
                             <option value="openai_realtime">OpenAI Realtime</option>
                             <option value="google_live">Google Live</option>
+                            <option value="grok">xAI Grok Voice Agent</option>
                             <option value="local">Local</option>
                             <option value="openai">OpenAI (Standard)</option>
                             <option value="telnyx">Telnyx (LLM)</option>
@@ -314,7 +334,14 @@ const ConfigEditor = () => {
         );
 
         const guessType = (data: any) => {
+            // Prefer explicit type field (multi-instance YAML) over shape inference.
+            if (data.type === 'grok') return 'grok';
             if (data.type === 'elevenlabs' || data.type === 'elevenlabs_agent' || data.agent_id || data.voice_id) return 'elevenlabs';
+            // Grok shape detection (legacy single-instance YAML without explicit type):
+            // - WebSocket base URL pointing at x.ai
+            // - Model name beginning with "grok-voice"
+            if ((data.base_url || '').includes('x.ai')) return 'grok';
+            if ((data.model || '').toString().startsWith('grok-voice')) return 'grok';
             if (data.realtime_base_url || data.turn_detection) return 'openai_realtime';
             if (data.google_live || data.llm_model?.includes('gemini')) return 'google_live';
             if (data.ws_url) return 'local';
@@ -336,6 +363,9 @@ const ConfigEditor = () => {
             case 'google_live':
                 FormComponent = GoogleLiveProviderForm;
                 break;
+            case 'grok':
+                FormComponent = GrokProviderForm;
+                break;
             case 'local':
                 FormComponent = LocalProviderForm;
                 break;
@@ -349,11 +379,14 @@ const ConfigEditor = () => {
                 FormComponent = DeepgramProviderForm;
         }
 
+        // Per-instance credentials only work for saved YAML entries.
+        const credKey = isNewProvider ? undefined : (editingProvider || undefined);
+
         return (
             <div className="space-y-4">
                 {commonFields}
                 <div className="border-t pt-4">
-                    <FormComponent config={providerForm} onChange={updateForm} />
+                    <FormComponent config={providerForm} onChange={updateForm} providerKey={credKey} />
                 </div>
             </div>
         );

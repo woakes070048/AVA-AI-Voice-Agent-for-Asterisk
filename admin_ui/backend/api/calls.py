@@ -10,7 +10,10 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
+import wave
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -520,6 +523,7 @@ async def get_call_transcript(record_id: str):
 
 _RECORDING_BASE = Path("/mnt/asterisk_recordings")
 _MIN_VALID_WAV_SIZE = 44  # WAV header is 44 bytes; files <= header size have no audio
+_RECORDING_EXTENSIONS = {".wav", ".ulaw", ".gsm"}
 
 
 def _has_exact_call_id(filename: str, call_id: str) -> bool:
@@ -535,6 +539,10 @@ def _has_exact_call_id(filename: str, call_id: str) -> bool:
     return bool(re.search(rf"(?<![0-9]){re.escape(call_id)}(?![0-9])", filename))
 
 
+def _is_supported_recording(match: Path) -> bool:
+    return match.suffix.lower() in _RECORDING_EXTENSIONS
+
+
 def _find_recording(call_id: str, start_time=None) -> Optional[Path]:
     """Find a recording file matching the given Asterisk call_id."""
     base = _RECORDING_BASE
@@ -543,12 +551,13 @@ def _find_recording(call_id: str, start_time=None) -> Optional[Path]:
 
     import glob as _glob_mod
     safe_id = _glob_mod.escape(call_id)
-    pattern = f"*{safe_id}*.wav"
+    pattern = f"*{safe_id}*.*"
 
     def _check(match: Path) -> bool:
         return (
             match.is_file()
             and match.resolve().is_relative_to(base.resolve())
+            and _is_supported_recording(match)
             and _has_exact_call_id(match.name, call_id)
         )
 
@@ -557,21 +566,129 @@ def _find_recording(call_id: str, start_time=None) -> Optional[Path]:
         dt = start_time if isinstance(start_time, datetime) else datetime.fromisoformat(str(start_time))
         date_dir = base / dt.strftime("%Y") / dt.strftime("%m") / dt.strftime("%d")
         if date_dir.is_dir():
-            for match in date_dir.glob(pattern):
+            for match in sorted(date_dir.glob(pattern)):
                 if _check(match):
                     return match
 
     # Fallback: root directory (legacy flat layout)
-    for match in base.glob(pattern):
+    for match in sorted(base.glob(pattern)):
         if _check(match):
             return match
 
     # Last resort: recursive search across all date folders
-    for match in base.glob(f"*/*/*/*{safe_id}*.wav"):
+    for match in sorted(base.glob(f"*/*/*/*{safe_id}*.*")):
         if _check(match):
             return match
 
     return None
+
+
+def _ulaw_recording_to_wav_bytes(recording: Path) -> bytes:
+    """Wrap raw 8 kHz mu-law bytes in a browser-playable PCM WAV container."""
+    import audioop
+
+    ulaw_data = recording.read_bytes()
+    pcm16 = audioop.ulaw2lin(ulaw_data, 2)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wavf:
+        wavf.setnchannels(1)
+        wavf.setsampwidth(2)
+        wavf.setframerate(8000)
+        wavf.writeframes(pcm16)
+    return buf.getvalue()
+
+
+def _wav_recording_requires_transcode(recording: Path) -> bool:
+    """Decide whether a .wav/.WAV recording needs a sox transcode for browser playback.
+
+    Decision is based on the WAV header (compression type), not filename
+    case. Previously `.WAV` (uppercase) was unconditionally marked as
+    transcode-required, which forced `sox` for what may be a perfectly
+    standard PCM WAV — and failed with 415 in environments without
+    `sox`. We now probe the actual content for both cases (Codex P2 on
+    PR #396).
+    """
+    if recording.suffix.lower() != ".wav":
+        return False
+    try:
+        with wave.open(str(recording), "rb") as wavf:
+            return wavf.getcomptype() != "NONE"
+    except (wave.Error, EOFError, OSError):
+        # Not a parseable WAV header (truncated, non-PCM container,
+        # corrupted) — needs sox to interpret whatever the file
+        # actually contains.
+        return True
+
+
+def _transcode_recording_to_wav_bytes(recording: Path) -> bytes:
+    sox = shutil.which("sox")
+    if not sox:
+        raise HTTPException(
+            status_code=415,
+            detail="Recording format requires sox for browser playback, but sox is not installed",
+        )
+    raw_timeout = os.getenv("AAVA_RECORDING_TRANSCODE_TIMEOUT_SEC", "120")
+    try:
+        timeout_sec = float(raw_timeout or "120")
+        if timeout_sec <= 0:
+            raise ValueError("must be > 0")
+    except (TypeError, ValueError):
+        # Don't let a typo'd env var (e.g. "120s" or empty string) escape
+        # as a 500 — fall back to the documented default. CodeRabbit
+        # quick-win on PR #396.
+        logger.warning(
+            "Invalid AAVA_RECORDING_TRANSCODE_TIMEOUT_SEC=%r; defaulting to 120s",
+            raw_timeout,
+        )
+        timeout_sec = 120.0
+    try:
+        result = subprocess.run(
+            [sox, str(recording), "-t", "wav", "-"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Recording transcode timed out")
+
+    if result.returncode != 0 or not result.stdout:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        logger.warning("Failed to transcode recording for playback: %s", stderr)
+        raise HTTPException(status_code=422, detail="Recording file could not be decoded for playback")
+    return result.stdout
+
+
+def _recording_response(recording: Path):
+    suffix = recording.suffix.lower()
+    if suffix == ".ulaw":
+        try:
+            wav_bytes = _ulaw_recording_to_wav_bytes(recording)
+        except Exception as err:
+            # Corrupt .ulaw should surface as a controlled client error,
+            # not a 500. Mirrors the sox transcode-failure path
+            # (CodeRabbit on PR #396).
+            logger.warning("Failed to decode .ulaw recording for playback: %s", err)
+            raise HTTPException(
+                status_code=422,
+                detail="Recording file could not be decoded for playback",
+            ) from err
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={"Content-Disposition": f'inline; filename="{recording.with_suffix(".wav").name}"'},
+        )
+    if suffix == ".gsm" or _wav_recording_requires_transcode(recording):
+        return Response(
+            content=_transcode_recording_to_wav_bytes(recording),
+            media_type="audio/wav",
+            headers={"Content-Disposition": f'inline; filename="{recording.with_suffix(".wav").name}"'},
+        )
+    return FileResponse(
+        path=str(recording),
+        media_type="audio/wav",
+        filename=recording.name,
+    )
 
 
 class RecordingInfoResponse(BaseModel):
@@ -604,9 +721,8 @@ async def get_call_recording_info(record_id: str):
     )
 
 
-@router.get("/calls/{record_id}/recording.wav")
-async def stream_call_recording(record_id: str):
-    """Stream the call recording WAV file for browser playback."""
+async def _stream_call_recording(record_id: str):
+    """Stream the call recording file for browser playback."""
     store = _get_call_history_store()
     record = await store.get(record_id)
     if not record:
@@ -616,14 +732,27 @@ async def stream_call_recording(record_id: str):
     if not recording or not recording.is_file():
         raise HTTPException(status_code=404, detail="Recording file not found")
 
-    if recording.stat().st_size <= _MIN_VALID_WAV_SIZE:
+    # Codec-aware empty detection: the 44-byte threshold is WAV-header
+    # specific. A .ulaw / .gsm recording with 44 bytes of audio is short
+    # but valid; only reject when (a) size==0, or (b) it's a .wav and
+    # the file is at or below the bare WAV header size (CodeRabbit on
+    # PR #396).
+    size = recording.stat().st_size
+    is_wav = recording.suffix.lower() == ".wav"
+    if size == 0 or (is_wav and size <= _MIN_VALID_WAV_SIZE):
         raise HTTPException(status_code=404, detail="Recording is empty (no audio captured)")
 
-    return FileResponse(
-        path=str(recording),
-        media_type="audio/wav",
-        filename=recording.name,
-    )
+    return _recording_response(recording)
+
+
+@router.get("/calls/{record_id}/recording/audio")
+async def stream_call_recording_audio(record_id: str):
+    return await _stream_call_recording(record_id)
+
+
+@router.get("/calls/{record_id}/recording.wav")
+async def stream_call_recording(record_id: str):
+    return await _stream_call_recording(record_id)
 
 
 @router.delete("/calls/{record_id}")

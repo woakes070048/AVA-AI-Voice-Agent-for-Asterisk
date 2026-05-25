@@ -147,10 +147,16 @@ const ContextForm = ({ config, providers, pipelines, availableTools, toolEnabled
     }));
 
     const providerOptions = Object.entries(providers || {})
-        .filter(([_, p]: [string, any]) => isFullAgentProvider(p))
+        .filter(([name, p]: [string, any]) => isFullAgentProvider(p, name))
+        // Hide disabled providers from the override picker unless the
+        // context is already pinned to one (so operators can clear a
+        // stale selection without losing visibility of what was set).
+        // Picking a disabled provider as a new override would silently
+        // route calls to nothing (CodeRabbit on PR #396).
+        .filter(([name, p]: [string, any]) => p.enabled !== false || config.provider === name)
         .map(([name, p]: [string, any]) => ({
             value: `provider:${name}`,
-            label: `[Provider] ${name}${p.enabled === false ? ' (Disabled)' : ''}`,
+            label: `[Provider] ${p.display_name || p.customer || name} (${name}, ${p.type || name})${p.customer ? ` · ${p.customer}` : ''}${p.enabled === false ? ' (Disabled)' : ''}`,
         }));
 
     const overrideValue = config.pipeline

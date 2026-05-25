@@ -19,6 +19,7 @@ from src.config.security import (
     inject_llm_config,
     inject_provider_api_keys,
 )
+from src.config.provider_instances import full_agent_default
 from src.config.defaults import (
     apply_transport_defaults,
     apply_audiosocket_defaults,
@@ -145,6 +146,11 @@ class LocalProviderConfig(BaseModel):
 
 class DeepgramProviderConfig(BaseModel):
     api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    type: Optional[str] = None
+    display_name: Optional[str] = None
+    customer: Optional[str] = None
     enabled: bool = Field(default=True)
     # The Deepgram Voice Agent's listen-provider model. Pre-v6.5.0 the listen
     # model was hardcoded to "nova-3" in src/providers/deepgram.py regardless
@@ -302,6 +308,12 @@ class MiniMaxLLMProviderConfig(BaseModel):
 
 class GoogleProviderConfig(BaseModel):
     api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    credentials_path: Optional[str] = None
+    type: Optional[str] = None
+    display_name: Optional[str] = None
+    customer: Optional[str] = None
     project_id: Optional[str] = None
     stt_base_url: str = Field(default="https://speech.googleapis.com/v1")
     tts_base_url: str = Field(default="https://texttospeech.googleapis.com/v1")
@@ -617,6 +629,11 @@ class MCPConfig(BaseModel):
 class OpenAIRealtimeProviderConfig(BaseModel):
     enabled: bool = Field(default=True)
     api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    type: Optional[str] = None
+    display_name: Optional[str] = None
+    customer: Optional[str] = None
     # "ga" = GA Realtime API (no beta header, gpt-realtime models)
     # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)
     # Default to beta for widest account compatibility out-of-box.
@@ -651,6 +668,67 @@ class OpenAIRealtimeProviderConfig(BaseModel):
         prefix_padding_ms: int = Field(default=200)
 
     turn_detection: Optional[TurnDetectionConfig] = None
+
+
+class GrokProviderConfig(BaseModel):
+    """Configuration for the xAI Grok Voice Agent realtime provider.
+
+    The Voice Agent API is OpenAI-Realtime-compatible at the wire level with
+    minor deviations (nested audio.{input,output}.format shape; ``response.text.delta``
+    event naming; 30-min session cap). This config models the xAI-native shape
+    directly; the OpenAI provider is NOT reused. See Provider-Grok-Setup.md.
+    """
+
+    enabled: bool = Field(default=True)
+    # Credentials: prefer per-instance api_key_file (set by admin UI); falls back to
+    # api_key_env name, then inline api_key, then legacy XAI_API_KEY env.
+    api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    # Connection
+    base_url: str = Field(default="wss://api.x.ai/v1/realtime")
+    model: str = Field(default="grok-voice-latest")
+    voice: str = Field(default="eve")  # named: eve|ara|rex|sal|leo, or a custom voice ID
+    instructions: Optional[str] = None
+    greeting: Optional[str] = None
+    # Audio defaults:
+    # - Input: μ-law @ 8 kHz passthrough (Asterisk-native — confirmed working).
+    # - Output: PCM16 @ 24 kHz. xAI ignores the per-session output_format declaration
+    #   and emits 24 kHz PCM16 regardless (no session.updated ACK arrives to negotiate
+    #   otherwise — observed on live calls 2026-05-22). Declaring the truth here means
+    #   the resampler correctly downsamples 24 kHz → 8 kHz for AudioSocket instead of
+    #   playing 24 kHz content at 8 kHz (which sounds garbled / chipmunk-slow).
+    input_encoding: str = Field(default="ulaw")
+    input_sample_rate_hz: int = Field(default=8000)
+    provider_input_encoding: str = Field(default="ulaw")  # "ulaw" or "linear16" (fallback)
+    provider_input_sample_rate_hz: int = Field(default=8000)
+    output_encoding: str = Field(default="linear16")  # xAI emits PCM16 in practice
+    output_sample_rate_hz: int = Field(default=24000)  # xAI's actual native output rate
+    target_encoding: str = Field(default="ulaw")  # AudioSocket egress format
+    target_sample_rate_hz: int = Field(default=8000)
+    input_gain_target_rms: int = Field(default=0)
+    input_gain_max_db: float = Field(default=0.0)
+    # Response shape
+    response_modalities: List[str] = Field(default_factory=lambda: ["text", "audio"])
+    egress_pacer_enabled: bool = Field(default=False)
+    egress_pacer_warmup_ms: int = Field(default=320)
+    # Multi-tenant display metadata (admin UI surfaces these)
+    display_name: Optional[str] = None
+    customer: Optional[str] = None
+    # YAML escape hatch for xAI-native tools (file_search, web_search, x_search, mcp).
+    # Each entry is sent as-is in session.update.tools, appended after function tools.
+    extra_tools: List[Dict[str, Any]] = Field(default_factory=list)
+    # 30-min session cap: warn at this elapsed second count
+    session_warn_after_seconds: int = Field(default=28 * 60)
+
+    class TurnDetectionConfig(BaseModel):
+        type: str = Field(default="server_vad")
+        silence_duration_ms: int = Field(default=200)
+        threshold: float = Field(default=0.5)
+        prefix_padding_ms: int = Field(default=200)
+
+    turn_detection: Optional[TurnDetectionConfig] = None
+
 
 class BargeInConfig(BaseModel):
     enabled: bool = Field(default=True)
@@ -809,6 +887,11 @@ def _normalize_pipelines(config_data: Dict[str, Any]) -> None:
     default_provider = config_data.get("default_provider", "openai_realtime")
     pipelines_cfg = config_data.get("pipelines")
 
+    if not pipelines_cfg and full_agent_default(config_data):
+        config_data["pipelines"] = {}
+        config_data.setdefault("active_pipeline", None)
+        return
+
     if not pipelines_cfg:
         _generate_default_pipeline(config_data)
         return
@@ -904,6 +987,10 @@ class AppConfig(BaseModel):
 def _generate_default_pipeline(config_data: Dict[str, Any]) -> None:
     """Populate a default pipeline entry when none are provided."""
     default_provider = config_data.get("default_provider", "openai_realtime")
+    if full_agent_default(config_data):
+        config_data.setdefault("pipelines", {})
+        config_data.setdefault("active_pipeline", None)
+        return
     pipeline_name = "default"
     # Milestone7: Align implicit defaults with the PipelineEntry schema.
     default_components = _compose_provider_components(default_provider)
@@ -997,8 +1084,8 @@ def load_config(path: str = "config/ai-agent.yaml") -> AppConfig:
         validate_providers(config_data)
         validate_pipelines(config_data)
     except ConfigValidationError as e:
-        logger.warning("Configuration validation warning", error=str(e))
-        # Log warning but don't fail - allow backward compatibility
+        logger.error("Configuration validation failed", error=str(e))
+        raise
     
     # Phase 5: Validate and return
     return AppConfig(**config_data)
@@ -1175,30 +1262,50 @@ def validate_production_config(config: AppConfig) -> tuple[list[str], list[str]]
             # Audio transport vs provider/pipeline availability
             audio_transport = getattr(config, "audio_transport", "externalmedia")
             
-            # Check for monolithic providers
-            monolithic_names = ("openai_realtime", "deepgram", "google_live")
+            # Check for full-agent (monolithic) providers via the
+            # provider-kind registry so multi-instance keys like
+            # `acme_grok` or `globex_openai_realtime` are recognized too
+            # — previously this only matched the canonical key names
+            # (`grok`, `openai_realtime`, …), so a multi-instance-only
+            # config was incorrectly flagged as "no provider configured"
+            # (CodeRabbit on PR #396).
+            from src.config.provider_instances import FULL_AGENT_KINDS, provider_kind
             monolithic_enabled = []
             for name, cfg in providers.items():
-                if name not in monolithic_names:
+                try:
+                    kind = provider_kind(str(name), cfg)
+                except Exception:
+                    # Surface parsing bugs at debug level so they're visible
+                    # in dev logs without spamming production (CodeRabbit
+                    # nitpick on PR #396). `continue` preserves the existing
+                    # "skip-unparseable-entries" behavior for the
+                    # has_monolithic determination.
+                    logger.debug(
+                        "provider_kind() failed during monolithic detection; skipping entry",
+                        provider=str(name),
+                        exc_info=True,
+                    )
+                    continue
+                if kind not in FULL_AGENT_KINDS:
                     continue
                 enabled = True
                 if isinstance(cfg, dict):
                     enabled = bool(cfg.get("enabled", True))
                 monolithic_enabled.append((name, enabled))
             has_monolithic = any(enabled for _, enabled in monolithic_enabled)
-            
+
             # Check for pipelines
             pipelines = getattr(config, "pipelines", {}) or {}
             if not isinstance(pipelines, dict):
                 pipelines = {}
             has_pipelines = bool(pipelines)
-            
+
             # Warn if transport has neither providers nor pipelines to use
             if audio_transport == "audiosocket":
                 if not has_monolithic and not has_pipelines:
                     warnings.append(
-                        "audio_transport=audiosocket but neither monolithic providers "
-                        "(openai_realtime, deepgram, google_live) nor pipelines are configured; "
+                        "audio_transport=audiosocket but neither a full-agent provider "
+                        "nor pipelines are configured; "
                         "AudioSocket requires at least one provider type to function"
                     )
             

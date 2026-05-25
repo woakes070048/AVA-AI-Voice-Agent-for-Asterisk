@@ -50,6 +50,25 @@ pipelines:
         format:
           encoding: ulaw
           sample_rate: 8000
+  # Privacy-focused hybrid: local STT/TTS with cloud LLM reasoning
+  local_hybrid:
+    stt: local_stt
+    llm: openai_llm
+    tts: local_tts
+    options:
+      stt:
+        chunk_ms: 320
+        streaming: true
+        stream_format: "pcm16_16k"
+      llm:
+        base_url: "https://api.openai.com/v1"
+        model: "gpt-4o-mini"
+        temperature: 0.4
+        max_tokens: 150
+      tts:
+        format:
+          encoding: ulaw
+          sample_rate: 8000
   # Local STT + OpenAI LLM + ElevenLabs TTS (premium voice quality)
   hybrid_elevenlabs:
     stt: local_stt
@@ -85,8 +104,10 @@ pipelines:
           encoding: mulaw
           sample_rate: 8000
 
-# Select an active pipeline when using the pipeline path
-active_pipeline: cloud_openai
+# Select an active pipeline when using the pipeline path.
+# Matches default_provider above (local_hybrid) so the example "just works" as a
+# privacy-focused local pipeline. Switch to cloud_openai for the cloud example.
+active_pipeline: local_hybrid
 
 # Transport modes
 # NOTE: For remote Asterisk deployments (AI engine on different machine than Asterisk):
@@ -141,6 +162,29 @@ streaming:
 
 # Providers (secrets from .env)
 providers:
+  # Multi-instance full-agent example:
+  # Use a stable provider key per customer, and set `type` to the implementation kind.
+  # Route calls with AI_PROVIDER=acme_google_live, or via contexts.<name>.provider.
+  #
+  # acme_google_live:
+  #   enabled: true
+  #   type: google_live
+  #   display_name: "Acme Google Live"
+  #   customer: "Acme"
+  #   use_vertex_ai: true
+  #   vertex_project: "acme-gcp-project"
+  #   vertex_location: "us-central1"
+  #   credentials_path: "/app/project/secrets/providers/acme_google_live/vertex-service-account.json"
+  #   llm_model: "gemini-live-2.5-flash-native-audio"
+  #
+  # globex_google_live:
+  #   enabled: true
+  #   type: google_live
+  #   display_name: "Globex Google Live"
+  #   customer: "Globex"
+  #   api_key_file: "/app/project/secrets/providers/globex_google_live/api-key"
+  #   llm_model: "gemini-2.5-flash-native-audio-latest"
+
   local:
     enabled: true
     # Local AI Server WebSocket URL. Default deployment uses host networking, so 127.0.0.1 is correct.
@@ -163,6 +207,50 @@ providers:
     model: "gpt-4o-realtime-preview-2024-12-17"  # GA: gpt-realtime / gpt-realtime-mini | Beta: gpt-4o-realtime-preview-*
     voice: "alloy"
     base_url: "wss://api.openai.com/v1/realtime"
+  # xAI Grok Voice Agent — full-agent realtime provider with native μ-law support.
+  # 30-min hard session cap (we log a warning at 28 min and let xAI close cleanly).
+  # Single-instance config: provider key == kind. See docs/Provider-Grok-Setup.md.
+  grok:
+    enabled: true
+    api_key: "${XAI_API_KEY}"
+    base_url: "wss://api.x.ai/v1/realtime"
+    model: "grok-voice-latest"  # or grok-voice-think-fast-1.0 (flagship)
+    voice: "eve"  # named: eve|ara|rex|sal|leo, or a custom cloned voice ID
+    # Input: μ-law @ 8 kHz passthrough (no resample) — matches Asterisk's native telephony.
+    # Output: PCM16 @ 24 kHz — xAI emits 24 kHz PCM16 regardless of what we declare in
+    # session.update (no session.updated ACK arrives). Declaring it correctly here means
+    # the resampler downsamples 24 kHz → 8 kHz for AudioSocket egress (no garble).
+    input_encoding: "ulaw"
+    input_sample_rate_hz: 8000
+    provider_input_encoding: "ulaw"
+    provider_input_sample_rate_hz: 8000
+    output_encoding: "linear16"
+    output_sample_rate_hz: 24000
+    target_encoding: "ulaw"
+    target_sample_rate_hz: 8000
+    session_warn_after_seconds: 1680  # 28 min — warn before 30-min hard cap
+    # Advanced (YAML-only): xAI-native tools (web_search, x_search, file_search, MCP).
+    # Each entry is forwarded verbatim into session.update.tools.
+    # extra_tools:
+    #   - {type: "web_search"}
+    #   - {type: "x_search", allowed_x_handles: ["xai"]}
+  # Multi-instance example: two isolated Grok configs with separate credential files
+  # at /app/project/secrets/providers/<key>/api-key. Route via Asterisk channel var
+  # AI_PROVIDER=acme_grok or contexts.<name>.provider: acme_grok.
+  # acme_grok:
+  #   enabled: true
+  #   type: grok
+  #   display_name: "Acme Grok"
+  #   customer: "Acme"
+  #   api_key_file: "/app/project/secrets/providers/acme_grok/api-key"
+  #   voice: "eve"
+  # globex_grok:
+  #   enabled: true
+  #   type: grok
+  #   display_name: "Globex Grok"
+  #   customer: "Globex"
+  #   api_key_file: "/app/project/secrets/providers/globex_grok/api-key"
+  #   voice: "rex"
   deepgram:
     enabled: true
     api_key: "${DEEPGRAM_API_KEY}"

@@ -4,6 +4,7 @@ import { AlertCircle, ArrowRight, Loader2, Cloud, Server, Shield, Zap, SkipForwa
 import axios from 'axios';
 import { toast } from 'sonner';
 import { useConfirmDialog } from '../hooks/useConfirmDialog';
+import HelpTooltip from '../components/ui/HelpTooltip';
 
 interface SetupConfig {
     provider: string;
@@ -22,7 +23,7 @@ interface SetupConfig {
     elevenlabs_key?: string;
     elevenlabs_agent_id?: string;
     cartesia_key?: string;
-    camb_key?: string;
+    xai_key?: string;
     greeting: string;
     ai_name: string;
     ai_role: string;
@@ -132,6 +133,7 @@ const Wizard = () => {
             'local_hybrid',
             'local',
             'elevenlabs_agent',
+            'grok',
         ]);
         return supported.has(provider) ? provider : 'openai_realtime';
     };
@@ -874,19 +876,9 @@ exten => s,1,NoOp(AI Agent Call)
                     return;
                 }
             }
-            if (config.provider === 'cambai') {
-                if (!config.camb_key) {
-                    showToast('CAMB AI API key is required.', 'error');
-                    return;
-                }
-                if (!config.deepgram_key) {
-                    showToast('Deepgram API key is required for CAMB AI pipeline (STT).', 'error');
-                    return;
-                }
-                if (!config.openai_key) {
-                    showToast('OpenAI API key is required for CAMB AI pipeline (LLM).', 'error');
-                    return;
-                }
+            if (config.provider === 'grok' && !config.xai_key) {
+                showToast('xAI API key is required for Grok Voice Agent.', 'error');
+                return;
             }
         }
 
@@ -994,34 +986,15 @@ exten => s,1,NoOp(AI Agent Call)
                     }
                 }
 
-                if (config.provider === 'cambai') {
-                    // CAMB AI pipeline requires three keys: CAMB AI (TTS), Deepgram (STT), OpenAI (LLM)
-                    if (!config.camb_key) {
-                        throw new Error('CAMB AI API Key is required');
+                if (config.provider === 'grok') {
+                    if (!config.xai_key) {
+                        throw new Error('xAI API Key is required for Grok Voice Agent');
                     }
-                    const cambRes = await axios.post('/api/wizard/validate-key', {
-                        provider: 'cambai',
-                        api_key: config.camb_key
+                    const res = await axios.post('/api/wizard/validate-key', {
+                        provider: 'grok',
+                        api_key: config.xai_key
                     });
-                    if (!cambRes.data.valid) throw new Error(`CAMB AI Key Invalid: ${cambRes.data.error}`);
-
-                    if (!config.deepgram_key) {
-                        throw new Error('Deepgram API Key is required for CAMB AI pipeline (STT)');
-                    }
-                    const dgRes = await axios.post('/api/wizard/validate-key', {
-                        provider: 'deepgram',
-                        api_key: config.deepgram_key
-                    });
-                    if (!dgRes.data.valid) throw new Error(`Deepgram Key Invalid: ${dgRes.data.error}`);
-
-                    if (!config.openai_key) {
-                        throw new Error('OpenAI API Key is required for CAMB AI pipeline (LLM)');
-                    }
-                    const oaRes = await axios.post('/api/wizard/validate-key', {
-                        provider: 'openai',
-                        api_key: config.openai_key
-                    });
-                    if (!oaRes.data.valid) throw new Error(`OpenAI Key Invalid: ${oaRes.data.error}`);
+                    if (!res.data.valid) throw new Error(`xAI Key Invalid: ${res.data.error}`);
                 }
 
                 // Only verify Local AI health for local_hybrid on step 3
@@ -1224,9 +1197,9 @@ exten => s,1,NoOp(AI Agent Call)
                                 icon={Cloud}
                             />
                             <ProviderCard
-                                id="cambai"
-                                title="CAMB AI"
-                                description="Multilingual MARS TTS (mars-flash ~150ms latency, voice cloning, 16+ languages). Pipeline: Deepgram STT + OpenAI LLM + CAMB AI TTS."
+                                id="grok"
+                                title="xAI Grok Voice Agent"
+                                description="Multilingual realtime (24+ languages including Hindi, Urdu, Arabic). $3/hr flat. μ-law direct telephony path; OpenAI-Realtime-compatible API."
                                 icon={Cloud}
                             />
                         </div>
@@ -1244,7 +1217,23 @@ exten => s,1,NoOp(AI Agent Call)
                                     <p className="text-blue-700 dark:text-blue-400">Requires an OpenAI API key.</p>
                                 </div>
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">OpenAI API Key</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">OpenAI API Key</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>OpenAI API Key</strong> — authorizes calls to the OpenAI Realtime speech-to-speech API.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Starts with <code>sk-</code></li>
+                                                        <li>Stored as <code>OPENAI_API_KEY</code></li>
+                                                        <li>Requires an account with Realtime API access</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://platform.openai.com/api-keys"
+                                            linkText="Get an API key"
+                                        />
+                                    </div>
                                     <div className="flex space-x-2">
                                         <input
                                             type="password"
@@ -1273,7 +1262,21 @@ exten => s,1,NoOp(AI Agent Call)
                                     <h3 className="font-medium text-lg">Local AI Configuration</h3>
 
                                     <div className="space-y-2">
-                                        <label className="text-sm font-medium">Language</label>
+                                        <div className="flex items-center gap-1.5">
+                                            <label className="text-sm font-medium">Language</label>
+                                            <HelpTooltip
+                                                content={
+                                                    <>
+                                                        <strong>Language</strong> — filters available STT and TTS models to those that support this locale.
+                                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                            <li>Use BCP-47 codes like <code>en-US</code></li>
+                                                            <li>Multi-language models always appear regardless of selection</li>
+                                                            <li>You can change this later per-context</li>
+                                                        </ul>
+                                                    </>
+                                                }
+                                            />
+                                        </div>
                                         <select
                                             className="w-full p-2 rounded-md border border-input bg-background"
                                             value={selectedLanguage}
@@ -1300,7 +1303,22 @@ exten => s,1,NoOp(AI Agent Call)
                                         <h4 className="font-medium text-sm text-muted-foreground uppercase tracking-wider">Speech-to-Text (STT)</h4>
                                         <div className="grid grid-cols-2 gap-4">
                                             <div>
-                                                <label className="text-sm font-medium">Backend</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Backend</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>STT Backend</strong> — engine that transcribes caller audio to text.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li><strong>Vosk</strong> — lightweight, runs on CPU, good default</li>
+                                                                    <li><strong>Kroko</strong> — multilingual; cloud (API key) or embedded</li>
+                                                                    <li><strong>Sherpa</strong> — fast ONNX models, may require rebuild</li>
+                                                                    <li><strong>Faster-Whisper</strong> — high accuracy; GPU recommended</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <select
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                     value={config.local_stt_backend}
@@ -1376,7 +1394,22 @@ exten => s,1,NoOp(AI Agent Call)
                                         )}
                                         {config.local_stt_backend === 'kroko' && !config.kroko_embedded && (
                                             <div>
-                                                <label className="text-sm font-medium">Kroko API Key</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Kroko API Key</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>Kroko API Key</strong> — authenticates against the Kroko hosted STT service.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li>Only required when running Kroko in Cloud mode</li>
+                                                                    <li>Switch to Embedded mode to skip the key (requires image rebuild)</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                        link="https://kroko.ai/"
+                                                        linkText="Kroko docs"
+                                                    />
+                                                </div>
                                                 <input
                                                     type="password"
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
@@ -1388,7 +1421,21 @@ exten => s,1,NoOp(AI Agent Call)
                                         )}
 
                                         <div className="space-y-2">
-                                            <label className="text-sm font-medium">Model</label>
+                                            <div className="flex items-center gap-1.5">
+                                                <label className="text-sm font-medium">Model</label>
+                                                <HelpTooltip
+                                                    content={
+                                                        <>
+                                                            <strong>STT Model</strong> — the specific speech recognition model for the selected backend and language.
+                                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                <li>Larger models are more accurate but slower</li>
+                                                                <li>Some models auto-download on first call</li>
+                                                                <li>Pick the smallest that meets your accuracy needs</li>
+                                                            </ul>
+                                                        </>
+                                                    }
+                                                />
+                                            </div>
                                             <div className="flex space-x-2">
                                                 <select
                                                     className="w-full p-2 rounded-md border border-input bg-background"
@@ -1452,7 +1499,22 @@ exten => s,1,NoOp(AI Agent Call)
                                         <h4 className="font-medium text-sm text-muted-foreground uppercase tracking-wider">Text-to-Speech (TTS)</h4>
                                         <div className="grid grid-cols-2 gap-4">
                                             <div>
-                                                <label className="text-sm font-medium">Backend</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Backend</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>TTS Backend</strong> — engine that synthesizes the agent's voice.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li><strong>Piper</strong> — fast CPU TTS, good default</li>
+                                                                    <li><strong>Kokoro (Local)</strong> — high-quality, runs in-container</li>
+                                                                    <li><strong>Kokoro (Cloud)</strong> — same voices via remote API</li>
+                                                                    <li><strong>MeloTTS / Silero</strong> — multilingual local options</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <select
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                     value={
@@ -1498,7 +1560,21 @@ exten => s,1,NoOp(AI Agent Call)
                                             </div></div>
 
                                         <div className="space-y-2">
-                                            <label className="text-sm font-medium">Model</label>
+                                            <div className="flex items-center gap-1.5">
+                                                <label className="text-sm font-medium">Model</label>
+                                                <HelpTooltip
+                                                    content={
+                                                        <>
+                                                            <strong>TTS Model / Voice</strong> — the specific voice for the selected backend.
+                                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                <li>Filtered by your chosen language</li>
+                                                                <li>Some voices auto-download on first call</li>
+                                                                <li>MeloTTS/Silero load voices automatically</li>
+                                                            </ul>
+                                                        </>
+                                                    }
+                                                />
+                                            </div>
                                             <div className="flex space-x-2">
                                                 <select
                                                     className="w-full p-2 rounded-md border border-input bg-background"
@@ -1576,7 +1652,20 @@ exten => s,1,NoOp(AI Agent Call)
 
                                         {config.local_tts_backend === 'kokoro' && config.kokoro_mode === 'api' && (
                                             <div>
-                                                <label className="text-sm font-medium">Kokoro API Key</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Kokoro API Key</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>Kokoro API Key</strong> — bearer token for the remote Kokoro TTS endpoint.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li>Only needed in Cloud/API mode</li>
+                                                                    <li>Many self-hosted Kokoro endpoints accept any token</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <input
                                                     type="password"
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
@@ -1588,7 +1677,21 @@ exten => s,1,NoOp(AI Agent Call)
                                         )}
                                         {config.local_tts_backend === 'kokoro' && config.kokoro_mode === 'local' && (
                                             <div>
-                                                <label className="text-sm font-medium">Voice</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Voice</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>Kokoro Voice</strong> — the speaker preset used for synthesis.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li><code>af_*</code> American female, <code>am_*</code> American male</li>
+                                                                    <li><code>bf_*</code> British female, <code>bm_*</code> British male</li>
+                                                                    <li>Heart and Bella are popular natural-sounding defaults</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <select
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                     value={config.kokoro_voice || 'af_heart'}
@@ -1644,7 +1747,21 @@ exten => s,1,NoOp(AI Agent Call)
                                     <div className="space-y-3 p-4 bg-muted/30 rounded-lg border">
                                         <h4 className="font-medium text-sm text-muted-foreground uppercase tracking-wider">Large Language Model (LLM)</h4>
                                         <div>
-                                            <label className="text-sm font-medium">Provider</label>
+                                            <div className="flex items-center gap-1.5">
+                                                <label className="text-sm font-medium">Provider</label>
+                                                <HelpTooltip
+                                                    content={
+                                                        <>
+                                                            <strong>LLM Provider</strong> — chooses which model handles reasoning in the hybrid pipeline.
+                                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                <li><strong>Groq</strong> — fast, free tier; weak tool calling</li>
+                                                                <li><strong>OpenAI</strong> — robust tool calling, paid</li>
+                                                                <li><strong>Ollama</strong> — self-hosted, no API key needed</li>
+                                                            </ul>
+                                                        </>
+                                                    }
+                                                />
+                                            </div>
                                             <select
                                                 className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                 value={config.hybrid_llm_provider || 'groq'}
@@ -1680,10 +1797,26 @@ exten => s,1,NoOp(AI Agent Call)
 
                                 {config.hybrid_llm_provider !== 'ollama' && (
                                     <div className="space-y-2">
-                                        <label className="text-sm font-medium">
-                                            {config.hybrid_llm_provider === 'groq' ? 'Groq API Key' : 'OpenAI API Key'}
-                                            <span className="text-muted-foreground font-normal ml-2">(for LLM only)</span>
-                                        </label>
+                                        <div className="flex items-center gap-1.5">
+                                            <label className="text-sm font-medium">
+                                                {config.hybrid_llm_provider === 'groq' ? 'Groq API Key' : 'OpenAI API Key'}
+                                                <span className="text-muted-foreground font-normal ml-2">(for LLM only)</span>
+                                            </label>
+                                            <HelpTooltip
+                                                content={
+                                                    <>
+                                                        <strong>{config.hybrid_llm_provider === 'groq' ? 'Groq API Key' : 'OpenAI API Key'}</strong> — used only for the LLM "think" stage; STT and TTS stay local.
+                                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                            <li>Groq keys start with <code>gsk_</code></li>
+                                                            <li>OpenAI keys start with <code>sk-</code></li>
+                                                            <li>Stored as <code>{config.hybrid_llm_provider === 'groq' ? 'GROQ_API_KEY' : 'OPENAI_API_KEY'}</code></li>
+                                                        </ul>
+                                                    </>
+                                                }
+                                                link={config.hybrid_llm_provider === 'groq' ? 'https://console.groq.com/keys' : 'https://platform.openai.com/api-keys'}
+                                                linkText="Get an API key"
+                                            />
+                                        </div>
                                         <div className="flex space-x-2">
                                             <input
                                                 type="password"
@@ -1716,7 +1849,22 @@ exten => s,1,NoOp(AI Agent Call)
                                     </p>
                                 </div>
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">Deepgram API Key</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">Deepgram API Key</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>Deepgram API Key</strong> — authorizes Deepgram Voice Agent (STT + TTS).
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Stored as <code>DEEPGRAM_API_KEY</code></li>
+                                                        <li>Project must have Voice Agent access enabled</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://developers.deepgram.com/"
+                                            linkText="Deepgram docs"
+                                        />
+                                    </div>
                                     <div className="flex space-x-2">
                                         <input
                                             type="password"
@@ -1737,7 +1885,23 @@ exten => s,1,NoOp(AI Agent Call)
                                     <p className="text-xs text-muted-foreground">For Deepgram STT and TTS.</p>
                                 </div>
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">OpenAI API Key (for Think stage)</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">OpenAI API Key (for Think stage)</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>OpenAI API Key</strong> — Deepgram's Voice Agent routes the "think" stage through OpenAI for LLM reasoning.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Starts with <code>sk-</code></li>
+                                                        <li>Stored as <code>OPENAI_API_KEY</code></li>
+                                                        <li>Separate from your Deepgram key</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://platform.openai.com/api-keys"
+                                            linkText="Get an API key"
+                                        />
+                                    </div>
                                     <div className="flex space-x-2">
                                         <input
                                             type="password"
@@ -1763,7 +1927,23 @@ exten => s,1,NoOp(AI Agent Call)
                         {config.provider === 'google_live' && (
                             <div className="space-y-4">
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">Google API Key</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">Google API Key</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>Google API Key</strong> — authorizes Gemini Live for end-to-end voice.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Starts with <code>AIza</code></li>
+                                                        <li>Stored as <code>GOOGLE_API_KEY</code></li>
+                                                        <li>For Vertex AI / GCP service accounts, configure later on the Providers page</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://ai.google.dev/"
+                                            linkText="Google AI docs"
+                                        />
+                                    </div>
                                     <div className="flex space-x-2">
                                         <input
                                             type="password"
@@ -1801,10 +1981,26 @@ exten => s,1,NoOp(AI Agent Call)
                                 </div>
 
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">
-                                        Agent ID
-                                        <span className="text-destructive ml-1">*</span>
-                                    </label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">
+                                            Agent ID
+                                            <span className="text-destructive ml-1">*</span>
+                                        </label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>Agent ID</strong> — identifies a pre-configured agent in your ElevenLabs dashboard.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Voice, system prompt, and LLM are set in the ElevenLabs UI</li>
+                                                        <li>Format: <code>agent_…</code></li>
+                                                        <li>Enable "Require authentication" on the agent</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://elevenlabs.io/docs/conversational-ai/overview"
+                                            linkText="ElevenLabs docs"
+                                        />
+                                    </div>
                                     <input
                                         type="text"
                                         className="w-full p-2 rounded-md border border-input bg-background font-mono text-sm"
@@ -1821,7 +2017,23 @@ exten => s,1,NoOp(AI Agent Call)
                                 </div>
 
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">ElevenLabs API Key</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">ElevenLabs API Key</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>ElevenLabs API Key</strong> — authorizes the Conversational AI Agent runtime.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Starts with <code>xi-</code></li>
+                                                        <li>Stored as <code>ELEVENLABS_API_KEY</code></li>
+                                                        <li>Find under Profile → API Keys</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://elevenlabs.io/docs"
+                                            linkText="ElevenLabs docs"
+                                        />
+                                    </div>
                                     <div className="flex space-x-2">
                                         <input
                                             type="password"
@@ -1853,28 +2065,44 @@ exten => s,1,NoOp(AI Agent Call)
                             </div>
                         )}
 
-                        {config.provider === 'cambai' && (
+                        {config.provider === 'grok' && (
                             <div className="space-y-4">
                                 <div className="bg-blue-50/50 dark:bg-blue-900/10 p-4 rounded-md border border-blue-100 dark:border-blue-900/20 text-sm text-blue-800 dark:text-blue-300">
-                                    <p className="font-semibold mb-1">CAMB AI Pipeline</p>
+                                    <p className="font-semibold mb-1">xAI Grok Voice Agent</p>
                                     <p className="text-blue-700 dark:text-blue-400">
-                                        Pipeline mode using <strong>Deepgram STT</strong> + <strong>OpenAI LLM</strong> + <strong>CAMB AI TTS</strong> (mars-flash, ~150ms latency).
-                                        Requires three API keys.
+                                        Realtime speech-to-speech with multilingual support (24+ languages). Wire-compatible with the
+                                        OpenAI Realtime API. Requires an xAI API key plus credits/license on the team account.
                                     </p>
                                 </div>
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">CAMB AI API Key</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">xAI API Key</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>xAI API Key</strong> — authorizes Grok Voice (wire-compatible with OpenAI Realtime).
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Starts with <code>xai-</code></li>
+                                                        <li>Stored as <code>XAI_API_KEY</code></li>
+                                                        <li>Team needs voice credits/license</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                            link="https://docs.x.ai/"
+                                            linkText="xAI docs"
+                                        />
+                                    </div>
                                     <div className="flex space-x-2">
                                         <input
                                             type="password"
                                             className="w-full p-2 rounded-md border border-input bg-background"
-                                            value={config.camb_key}
-                                            onChange={e => setConfig({ ...config, camb_key: e.target.value })}
-                                            placeholder="UUID..."
+                                            value={config.xai_key || ''}
+                                            onChange={e => setConfig({ ...config, xai_key: e.target.value })}
+                                            placeholder="xai-..."
                                         />
                                         <button
                                             type="button"
-                                            onClick={() => handleTestKey('cambai', config.camb_key || '')}
+                                            onClick={() => handleTestKey('grok', config.xai_key || '')}
                                             className="px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80"
                                             disabled={loading}
                                         >
@@ -1882,53 +2110,20 @@ exten => s,1,NoOp(AI Agent Call)
                                         </button>
                                     </div>
                                     <p className="text-xs text-muted-foreground">
-                                        Get yours at{' '}
-                                        <a href="https://studio.camb.ai" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
-                                            studio.camb.ai
+                                        Get a key at{' '}
+                                        <a href="https://console.x.ai/team/default/api-keys" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+                                            console.x.ai
                                         </a>
+                                        . Defaults to voice <code>eve</code>, model <code>grok-voice-latest</code>. Tune both on the Providers page after setup.
                                     </p>
                                 </div>
-                                <div className="space-y-2">
-                                    <label className="text-sm font-medium">Deepgram API Key (for STT)</label>
-                                    <div className="flex space-x-2">
-                                        <input
-                                            type="password"
-                                            className="w-full p-2 rounded-md border border-input bg-background"
-                                            value={config.deepgram_key}
-                                            onChange={e => setConfig({ ...config, deepgram_key: e.target.value })}
-                                            placeholder="Token..."
-                                        />
-                                        <button
-                                            type="button"
-                                            onClick={() => handleTestKey('deepgram', config.deepgram_key || '')}
-                                            className="px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80"
-                                            disabled={loading}
-                                        >
-                                            Test
-                                        </button>
-                                    </div>
-                                    <p className="text-xs text-muted-foreground">For speech-to-text transcription.</p>
-                                </div>
-                                <div className="space-y-2">
-                                    <label className="text-sm font-medium">OpenAI API Key (for LLM)</label>
-                                    <div className="flex space-x-2">
-                                        <input
-                                            type="password"
-                                            className="w-full p-2 rounded-md border border-input bg-background"
-                                            value={config.openai_key}
-                                            onChange={e => setConfig({ ...config, openai_key: e.target.value })}
-                                            placeholder="sk-..."
-                                        />
-                                        <button
-                                            type="button"
-                                            onClick={() => handleTestKey('openai', config.openai_key || '')}
-                                            className="px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80"
-                                            disabled={loading}
-                                        >
-                                            Test
-                                        </button>
-                                    </div>
-                                    <p className="text-xs text-muted-foreground">For LLM reasoning (gpt-4o-mini by default).</p>
+                                <div className="bg-amber-50/50 dark:bg-amber-900/10 p-4 rounded-md border border-amber-100 dark:border-amber-900/20">
+                                    <h4 className="font-semibold mb-2 text-amber-800 dark:text-amber-300 text-sm">Notes</h4>
+                                    <ul className="text-xs text-amber-700 dark:text-amber-400 space-y-1 list-disc list-inside">
+                                        <li>xAI documents a 30-minute hard session cap. We log a warning at 28 min.</li>
+                                        <li>Cost: $3/hour flat (≈ $0.05/min), regardless of voice or model.</li>
+                                        <li>Output is PCM16 @ 24 kHz (xAI emits this regardless of session.update declaration).</li>
+                                    </ul>
                                 </div>
                             </div>
                         )}
@@ -2028,7 +2223,21 @@ exten => s,1,NoOp(AI Agent Call)
                                         </p>
                                         <div className="grid grid-cols-2 gap-4">
                                             <div>
-                                                <label className="text-sm font-medium">Primary Language</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Primary Language</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>Primary Language</strong> — the locale your agent will primarily speak and understand.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li>Filters STT models and TTS voices to this language</li>
+                                                                    <li>Multi-language voices appear regardless</li>
+                                                                    <li>Pick the language most of your callers use</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <select
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                     value={selectedLanguage}
@@ -2090,7 +2299,21 @@ exten => s,1,NoOp(AI Agent Call)
                                         <h4 className="font-medium text-sm text-muted-foreground uppercase tracking-wider">Speech-to-Text (STT)</h4>
                                         <div className="grid grid-cols-2 gap-4">
                                             <div>
-                                                <label className="text-sm font-medium">Model</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Model</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>STT Model</strong> — picks both the engine (Vosk, Kroko, Faster-Whisper, etc.) and the specific weights.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li>Filtered by your selected language</li>
+                                                                    <li>"requires rebuild" entries need a Docker image rebuild</li>
+                                                                    <li>Larger models are more accurate but slower</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <select
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                     value={config.local_stt_model || config.local_stt_backend}
@@ -2141,7 +2364,20 @@ exten => s,1,NoOp(AI Agent Call)
                                         </div>
                                         {config.local_stt_backend === 'kroko' && !config.kroko_embedded && (
                                             <div>
-                                                <label className="text-sm font-medium">Kroko API Key</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Kroko API Key</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>Kroko API Key</strong> — authenticates against Kroko's hosted STT service.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li>Only needed when Kroko runs in Cloud mode</li>
+                                                                    <li>Switch to Embedded to skip the key (requires rebuild)</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <input
                                                     type="password"
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
@@ -2158,7 +2394,21 @@ exten => s,1,NoOp(AI Agent Call)
                                         <h4 className="font-medium text-sm text-muted-foreground uppercase tracking-wider">Text-to-Speech (TTS)</h4>
                                         <div className="grid grid-cols-2 gap-4">
                                             <div>
-                                                <label className="text-sm font-medium">Voice / Model</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Voice / Model</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>TTS Voice / Model</strong> — chooses both the synthesis engine and the speaker.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li><strong>Piper</strong> — fast CPU, neutral voices</li>
+                                                                    <li><strong>Kokoro</strong> — natural, high-quality voices</li>
+                                                                    <li><strong>MeloTTS / Silero</strong> — multilingual local options</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <select
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                     value={config.local_tts_model || config.local_tts_backend}
@@ -2210,7 +2460,21 @@ exten => s,1,NoOp(AI Agent Call)
                                             </div>
                                             {config.local_tts_backend === 'kokoro' && (
                                                 <div>
-                                                    <label className="text-sm font-medium">Kokoro Mode</label>
+                                                    <div className="flex items-center gap-1.5">
+                                                        <label className="text-sm font-medium">Kokoro Mode</label>
+                                                        <HelpTooltip
+                                                            content={
+                                                                <>
+                                                                    <strong>Kokoro Mode</strong> — where Kokoro TTS executes.
+                                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                        <li><strong>Local</strong> — weights downloaded into the container; recommended</li>
+                                                                        <li><strong>Cloud/API</strong> — calls a remote OpenAI-compatible endpoint</li>
+                                                                        <li><strong>HuggingFace</strong> — auto-fetches via HF cache (advanced)</li>
+                                                                    </ul>
+                                                                </>
+                                                            }
+                                                        />
+                                                    </div>
                                                     <select
                                                         className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                         value={(config.kokoro_mode || 'local').toLowerCase()}
@@ -2235,7 +2499,21 @@ exten => s,1,NoOp(AI Agent Call)
                                             )}
                                             {config.local_tts_backend === 'kokoro' && ['local', 'hf'].includes((config.kokoro_mode || 'local').toLowerCase()) && (
                                                 <div>
-                                                    <label className="text-sm font-medium">Voice</label>
+                                                    <div className="flex items-center gap-1.5">
+                                                        <label className="text-sm font-medium">Voice</label>
+                                                        <HelpTooltip
+                                                            content={
+                                                                <>
+                                                                    <strong>Kokoro Voice</strong> — the speaker preset Kokoro uses.
+                                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                        <li><code>af_*</code> American female, <code>am_*</code> American male</li>
+                                                                        <li><code>bf_*</code> British female, <code>bm_*</code> British male</li>
+                                                                        <li>Heart and Bella are popular natural defaults</li>
+                                                                    </ul>
+                                                                </>
+                                                            }
+                                                        />
+                                                    </div>
                                                     <select
                                                         className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                         value={config.kokoro_voice || 'af_heart'}
@@ -2261,7 +2539,20 @@ exten => s,1,NoOp(AI Agent Call)
                                         </div>
                                         {config.local_tts_backend === 'kokoro' && (config.kokoro_mode || '').toLowerCase() === 'api' && (
                                             <div>
-                                                <label className="text-sm font-medium">Kokoro Web API</label>
+                                                <div className="flex items-center gap-1.5">
+                                                    <label className="text-sm font-medium">Kokoro Web API</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>Kokoro Web API URL</strong> — base URL of an OpenAI-compatible <code>audio/speech</code> endpoint.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li>Self-hosting is recommended for production reliability</li>
+                                                                    <li>The default points to a public demo endpoint</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <input
                                                     type="text"
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
@@ -2272,7 +2563,20 @@ exten => s,1,NoOp(AI Agent Call)
                                                 <p className="text-xs text-muted-foreground mt-1">
                                                     Supports OpenAI-compatible `audio/speech` endpoint. Recommended to self-host for reliability.
                                                 </p>
-                                                <label className="text-sm font-medium mt-3 block">Token (optional)</label>
+                                                <div className="flex items-center gap-1.5 mt-3">
+                                                    <label className="text-sm font-medium block">Token (optional)</label>
+                                                    <HelpTooltip
+                                                        content={
+                                                            <>
+                                                                <strong>Token</strong> — optional bearer token for the Kokoro Web API.
+                                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                    <li>Many self-hosted endpoints accept any token</li>
+                                                                    <li>The dashboard requires a token to enable Cloud/API mode</li>
+                                                                </ul>
+                                                            </>
+                                                        }
+                                                    />
+                                                </div>
                                                 <input
                                                     type="password"
                                                     className="w-full p-2 rounded-md border border-input bg-background mt-1"
@@ -2295,7 +2599,21 @@ exten => s,1,NoOp(AI Agent Call)
                                     <div className="space-y-3 p-4 bg-muted/30 rounded-lg border">
                                         <h4 className="font-medium text-sm text-muted-foreground uppercase tracking-wider">Large Language Model (LLM)</h4>
                                         <div>
-                                            <label className="text-sm font-medium">Model</label>
+                                            <div className="flex items-center gap-1.5">
+                                                <label className="text-sm font-medium">Model</label>
+                                                <HelpTooltip
+                                                    content={
+                                                        <>
+                                                            <strong>Local LLM Model</strong> — the on-device language model used for reasoning.
+                                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                <li>Models within your RAM budget are listed first</li>
+                                                                <li>Phi-3 Mini is a good CPU-friendly default</li>
+                                                                <li>Larger models give better quality but slower replies</li>
+                                                            </ul>
+                                                        </>
+                                                    }
+                                                />
+                                            </div>
                                             <select
                                                 className="w-full p-2 rounded-md border border-input bg-background mt-1"
                                                 value={config.local_llm_model}
@@ -2463,7 +2781,23 @@ exten => s,1,NoOp(AI Agent Call)
                         <h2 className="text-xl font-semibold mb-4">Agent Configuration</h2>
                         <div className="grid grid-cols-2 gap-4">
                             <div className="space-y-2">
-                                <label className="text-sm font-medium">Asterisk Host</label>
+                                <div className="flex items-center gap-1.5">
+                                    <label className="text-sm font-medium">Asterisk Host</label>
+                                    <HelpTooltip
+                                        content={
+                                            <>
+                                                <strong>Asterisk Host</strong> — IP or hostname where Asterisk is reachable from the AI engine.
+                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                    <li>Use <code>127.0.0.1</code> when Asterisk runs on the same host</li>
+                                                    <li>Use the LAN IP for a remote PBX</li>
+                                                    <li>If you enter a hostname, you'll be asked for the server IP separately (for RTP)</li>
+                                                </ul>
+                                            </>
+                                        }
+                                        link="https://wiki.asterisk.org/wiki/display/AST/Asterisk+REST+Interface"
+                                        linkText="ARI docs"
+                                    />
+                                </div>
                                 <input
                                     type="text"
                                     className="w-full p-2 rounded-md border border-input bg-background"
@@ -2472,7 +2806,20 @@ exten => s,1,NoOp(AI Agent Call)
                                 />
                             </div>
                             <div className="space-y-2">
-                                <label className="text-sm font-medium">ARI Username</label>
+                                <div className="flex items-center gap-1.5">
+                                    <label className="text-sm font-medium">ARI Username</label>
+                                    <HelpTooltip
+                                        content={
+                                            <>
+                                                <strong>ARI Username</strong> — the user defined in <code>ari.conf</code> on the Asterisk server.
+                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                    <li>Default in many configs is <code>asterisk</code></li>
+                                                    <li>Must have <code>read = all</code> and <code>write = all</code></li>
+                                                </ul>
+                                            </>
+                                        }
+                                    />
+                                </div>
                                 <input
                                     type="text"
                                     className="w-full p-2 rounded-md border border-input bg-background"
@@ -2481,7 +2828,20 @@ exten => s,1,NoOp(AI Agent Call)
                                 />
                             </div>
                             <div className="space-y-2">
-                                <label className="text-sm font-medium">ARI Port</label>
+                                <div className="flex items-center gap-1.5">
+                                    <label className="text-sm font-medium">ARI Port</label>
+                                    <HelpTooltip
+                                        content={
+                                            <>
+                                                <strong>ARI Port</strong> — TCP port for the Asterisk REST Interface (HTTP server).
+                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                    <li>Default is <code>8088</code> (HTTP) or <code>8089</code> (HTTPS)</li>
+                                                    <li>Set in <code>http.conf</code> via <code>bindport</code></li>
+                                                </ul>
+                                            </>
+                                        }
+                                    />
+                                </div>
                                 <input
                                     type="number"
                                     className="w-full p-2 rounded-md border border-input bg-background"
@@ -2490,7 +2850,20 @@ exten => s,1,NoOp(AI Agent Call)
                                 />
                             </div>
                             <div className="space-y-2">
-                                <label className="text-sm font-medium">ARI Scheme</label>
+                                <div className="flex items-center gap-1.5">
+                                    <label className="text-sm font-medium">ARI Scheme</label>
+                                    <HelpTooltip
+                                        content={
+                                            <>
+                                                <strong>ARI Scheme</strong> — transport for the ARI connection.
+                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                    <li><code>http</code> — plaintext, fine on a trusted LAN</li>
+                                                    <li><code>https</code> — TLS; required for remote/public links</li>
+                                                </ul>
+                                            </>
+                                        }
+                                    />
+                                </div>
                                 <select
                                     className="w-full p-2 rounded-md border border-input bg-background"
                                     value={config.asterisk_scheme}
@@ -2517,7 +2890,23 @@ exten => s,1,NoOp(AI Agent Call)
                                 </div>
                             )}
                             <div className="space-y-2">
-                                <label className="text-sm font-medium">Stasis App Name</label>
+                                <div className="flex items-center gap-1.5">
+                                    <label className="text-sm font-medium">Stasis App Name</label>
+                                    <HelpTooltip
+                                        content={
+                                            <>
+                                                <strong>Stasis App Name</strong> — the application name used in your dialplan's <code>Stasis()</code> call.
+                                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                    <li>Must match exactly between dialplan and AI engine</li>
+                                                    <li>Default: <code>asterisk-ai-voice-agent</code></li>
+                                                    <li>Only change if you already use this name for something else</li>
+                                                </ul>
+                                            </>
+                                        }
+                                        link="https://wiki.asterisk.org/wiki/display/AST/Asterisk+REST+Interface"
+                                        linkText="ARI / Stasis docs"
+                                    />
+                                </div>
                                 <input
                                     type="text"
                                     className="w-full p-2 rounded-md border border-input bg-background"
@@ -2541,7 +2930,21 @@ exten => s,1,NoOp(AI Agent Call)
                                     </div>
                                 </div>
                                 <div className="space-y-2">
-                                    <label className="text-sm font-medium">Asterisk Server IP Address</label>
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">Asterisk Server IP Address</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>Asterisk Server IP</strong> — the resolved IP of the Asterisk PBX, used for RTP packet validation.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>Required when the host is a name, not an IP</li>
+                                                        <li>Populates <code>allowed_remote_hosts</code> on the RTP listener</li>
+                                                        <li>Must be reachable from the AI engine container</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                        />
+                                    </div>
                                     <input
                                         type="text"
                                         placeholder="e.g., 192.168.1.100 or 203.0.113.50"
@@ -2558,7 +2961,21 @@ exten => s,1,NoOp(AI Agent Call)
                         )}
 
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">ARI Password</label>
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">ARI Password</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>ARI Password</strong> — the password for the ARI user from <code>ari.conf</code>.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Set on the Asterisk side in <code>/etc/asterisk/ari.conf</code></li>
+                                                <li>Stored encrypted in the AI engine config</li>
+                                                <li>Use the Test Connection button to verify</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
                             <input
                                 type="password"
                                 className="w-full p-2 rounded-md border border-input bg-background"
@@ -2620,6 +3037,18 @@ exten => s,1,NoOp(AI Agent Call)
                                         The name your AI agent will use to identify itself to callers.
                                     </div>
                                 </div>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>AI Name</strong> — injected into the system prompt so the agent can introduce itself.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Used in greetings and self-references</li>
+                                                <li>Pick something short and pronounceable by TTS</li>
+                                                <li>Can be overridden per Context</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
                             </div>
                             <input
                                 type="text"
@@ -2638,6 +3067,18 @@ exten => s,1,NoOp(AI Agent Call)
                                         Defines the AI's persona and behavior. This becomes part of the system prompt.
                                     </div>
                                 </div>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>AI Role</strong> — describes who the agent is and how it should behave. Becomes part of the system prompt.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Include the domain (support, scheduling, sales)</li>
+                                                <li>Add constraints ("never quote prices", "always confirm name")</li>
+                                                <li>Define escalation rules (transfer when…)</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
                             </div>
                             <input
                                 type="text"
@@ -2656,6 +3097,18 @@ exten => s,1,NoOp(AI Agent Call)
                                         The first message spoken when a call connects. Keep it brief and welcoming.
                                     </div>
                                 </div>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Greeting Message</strong> — the first thing the agent says when a call connects.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Keep it under 2 sentences (callers expect a quick prompt)</li>
+                                                <li>State the brand/agent name and offer help</li>
+                                                <li>Avoid open-ended questions that confuse STT timing</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
                             </div>
                             <textarea
                                 className="w-full p-2 rounded-md border border-input bg-background min-h-[80px]"

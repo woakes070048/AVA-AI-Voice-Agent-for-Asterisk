@@ -1,10 +1,20 @@
 """
-OpenAI Realtime provider implementation.
+xAI Grok Voice Agent realtime provider implementation.
 
-This module integrates OpenAI's server-side Realtime WebSocket transport into the
-Asterisk AI Voice Agent without requiring WebRTC. Audio from AudioSocket is
-upsampled to PCM16 @ 24 kHz, streamed to OpenAI, and PCM16 24 kHz output is
-resampled to the configured downstream AudioSocket format (µ-law or PCM16 8 kHz).
+This module integrates xAI's server-side Voice Agent WebSocket transport into
+the Asterisk AI Voice Agent. The default audio path is μ-law @ 8 kHz passthrough
+both inbound and outbound — Asterisk's native telephony format streams directly
+to xAI without resampling. A PCM16 fallback branch is preserved in code and
+gated by GrokProviderConfig.provider_input_encoding="linear16".
+
+xAI's Voice Agent API is OpenAI-Realtime-compatible at the wire level with three
+deviations: session.update uses the nested ``audio.{input,output}.format`` shape;
+the text-delta event is ``response.text.delta`` (not ``response.output_text.delta``);
+a 30-min session cap applies (we warn at 28 min and let xAI close cleanly).
+
+# SYNC-WITH-OPENAI-REALTIME: This module is a structural sibling of
+# src/providers/openai_realtime.py. Bug fixes to shared logic (barge-in, audio
+# gating, reconnect, tool roundtrip) should be considered for both files.
 """
 
 from __future__ import annotations
@@ -31,11 +41,11 @@ from ..audio import (
     mulaw_to_pcm16le,
     resample_audio,
 )
-from ..config import OpenAIRealtimeProviderConfig
+from ..config import GrokProviderConfig
 
 # Tool calling support
 from src.tools.registry import tool_registry
-from src.tools.adapters.openai import OpenAIToolAdapter
+from src.tools.adapters.grok import GrokToolAdapter
 
 logger = get_logger(__name__)
 
@@ -52,27 +62,27 @@ def _log_provider_task_exception(task: asyncio.Task) -> None:
 _COMMIT_INTERVAL_SEC = 0.2
 _KEEPALIVE_INTERVAL_SEC = 15.0
 
-_OPENAI_ASSUMED_OUTPUT_RATE = Gauge(
-    "ai_agent_openai_assumed_output_sample_rate_hz",
-    "Configured OpenAI Realtime output sample rate per call",
+_GROK_ASSUMED_OUTPUT_RATE = Gauge(
+    "ai_agent_grok_assumed_output_sample_rate_hz",
+    "Configured Grok Voice Agent output sample rate per call",
 )
-_OPENAI_PROVIDER_OUTPUT_RATE = Gauge(
-    "ai_agent_openai_provider_output_sample_rate_hz",
-    "Provider-advertised OpenAI Realtime output sample rate per call",
+_GROK_PROVIDER_OUTPUT_RATE = Gauge(
+    "ai_agent_grok_provider_output_sample_rate_hz",
+    "Provider-advertised Grok Voice Agent output sample rate per call",
 )
-_OPENAI_MEASURED_OUTPUT_RATE = Gauge(
-    "ai_agent_openai_measured_output_sample_rate_hz",
-    "Measured OpenAI Realtime output sample rate per call",
+_GROK_MEASURED_OUTPUT_RATE = Gauge(
+    "ai_agent_grok_measured_output_sample_rate_hz",
+    "Measured Grok Voice Agent output sample rate per call",
 )
-_OPENAI_SESSION_AUDIO_INFO = Info(
-    "ai_agent_openai_session_audio",
-    "OpenAI Realtime session audio format assumptions and provider acknowledgements",
+_GROK_SESSION_AUDIO_INFO = Info(
+    "ai_agent_grok_session_audio",
+    "Grok Voice Agent session audio format assumptions and provider acknowledgements",
 )
 
 
-class OpenAIRealtimeProvider(AIProviderInterface):
+class GrokProvider(AIProviderInterface):
     """
-    OpenAI Realtime provider using server-side WebSocket transport.
+    Grok Voice Agent provider using server-side WebSocket transport.
 
     Lifecycle:
     1. start_session(call_id) -> establishes WebSocket session.
@@ -85,13 +95,17 @@ class OpenAIRealtimeProvider(AIProviderInterface):
 
     def __init__(
         self,
-        config: OpenAIRealtimeProviderConfig,
+        config: GrokProviderConfig,
         on_event,
         gating_manager=None,
+        provider_key: str = "grok",
     ):
         super().__init__(on_event)
-        self.set_provider_identity(provider_key="openai_realtime", provider_kind="openai_realtime")
+        self.set_provider_identity(provider_key=provider_key, provider_kind="grok")
+        self.provider_key: str = provider_key
         self.config = config
+        self._session_started_ts: float = 0.0  # for 30-min session cap warning
+        self._session_warned_long_session: bool = False
         self.websocket: Optional[ClientConnection] = None
         self._receive_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
@@ -108,13 +122,18 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._hangup_after_response: bool = False  # Flag to trigger hangup after next response
         self._farewell_timeout_task: Optional[asyncio.Task] = None  # Timeout fallback for hangup
         self._greeting_vad_task: Optional[asyncio.Task] = None
+        # End-of-call fallback: track last user transcript so we can detect
+        # "user said goodbye + assistant said goodbye but didn't invoke hangup_call"
+        # and arm session.cleanup_after_tts to hangup once audio finishes.
+        self._last_final_user_text: str = ""
+        self._hangup_fallback_armed: bool = False
         self._background_tasks: set[asyncio.Task] = set()
         self._in_audio_burst: bool = False
         # Track whether ANY audio was emitted during a given response (response_id -> bool).
         # _in_audio_burst is only "currently emitting", and is often false by response.done.
         self._audio_seen_response_ids: set[str] = set()
         # Per-response "done" events. A function_call handler must wait for its parent response's
-        # response.done before submitting function_call_output, otherwise OpenAI may reject the
+        # response.done before submitting function_call_output, otherwise Grok may reject the
         # output with invalid_tool_call_id ("Tool call ID ... not found in conversation") — which
         # in turn causes the LLM to retry and duplicate side-effectful tool calls (e.g. creating
         # multiple calendar events). See _handle_function_call() for the wait logic.
@@ -151,9 +170,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         # Audio gating for echo prevention
         self._gating_manager = gating_manager
         if self._gating_manager:
-            logger.info("🎛️ Audio gating enabled for OpenAI Realtime (echo prevention)")
+            logger.info("🎛️ Audio gating enabled for Grok Voice Agent (echo prevention)")
         else:
-            logger.debug("Audio gating not available for OpenAI Realtime")
+            logger.debug("Audio gating not available for Grok Voice Agent")
         self._last_commit_ts: float = 0.0
         # Serialize append/commit to avoid empty commits from races
         self._audio_lock: asyncio.Lock = asyncio.Lock()
@@ -189,8 +208,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._reconnect_task: Optional[asyncio.Task] = None
 
         # Tool calling support
-        self.tool_adapter = OpenAIToolAdapter(tool_registry)
-        logger.info("🛠️  OpenAI Realtime provider initialized with tool support")
+        self.tool_adapter = GrokToolAdapter(tool_registry)
+        logger.info("🛠️  Grok Voice Agent provider initialized with tool support")
 
         try:
             if self.config.input_encoding:
@@ -223,8 +242,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         # NOTE: Intentional transcoding (slin ↔ ulaw) is supported - system handles conversion
         if inbound_enc in ("slin16", "linear16", "pcm16") and _class(audiosocket_format) == "ulaw":
             issues.append(
-                "OpenAI inbound encoding is PCM16 but AudioSocket format is μ-law; set audiosocket.format=slin16 "
-                "or change openai_realtime.input_encoding to ulaw."
+                "Grok inbound encoding is PCM16 but AudioSocket format is μ-law; set audiosocket.format=slin16 "
+                "or change grok.input_encoding to ulaw."
             )
         elif inbound_enc in ("ulaw", "mulaw", "g711_ulaw", "mu-law") and _class(audiosocket_format) == "ulaw":
             # Perfect alignment: both ulaw
@@ -236,11 +255,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # Only warn if it's not a supported transcoding path
             if audiosocket_format not in ("slin", "slin16", "linear16", "pcm16"):
                 issues.append(
-                    f"OpenAI inbound encoding {inbound_enc} does not match audiosocket.format={audiosocket_format}."
+                    f"Grok inbound encoding {inbound_enc} does not match audiosocket.format={audiosocket_format}."
                 )
         if inbound_enc in ("ulaw", "mulaw", "g711_ulaw", "mu-law") and inbound_rate and inbound_rate != 8000:
             issues.append(
-                f"OpenAI inbound μ-law sample rate is {inbound_rate} Hz; μ-law transport should be 8000 Hz."
+                f"Grok inbound μ-law sample rate is {inbound_rate} Hz; μ-law transport should be 8000 Hz."
             )
 
         # Check target encoding vs streaming manager output
@@ -257,11 +276,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         else:
             # Warn only for unexpected mismatches
             issues.append(
-                f"OpenAI target_encoding={target_enc} but streaming manager emits {streaming_encoding}."
+                f"Grok target_encoding={target_enc} but streaming manager emits {streaming_encoding}."
             )
         if target_rate and target_rate != streaming_sample_rate:
             issues.append(
-                f"OpenAI target_sample_rate_hz={target_rate} but streaming sample rate is {streaming_sample_rate}."
+                f"Grok target_sample_rate_hz={target_rate} but streaming sample rate is {streaming_sample_rate}."
             )
 
         provider_rate = int(self.config.provider_input_sample_rate_hz or 0)
@@ -269,14 +288,14 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         if provider_rate:
             if provider_enc in ("ulaw", "mulaw", "g711_ulaw", "mu-law", "alaw", "g711_alaw") and provider_rate != 8000:
                 issues.append(
-                    f"OpenAI provider_input_sample_rate_hz={provider_rate}; G.711 (μ-law/a-law) should be 8000 Hz."
+                    f"Grok provider_input_sample_rate_hz={provider_rate}; G.711 (μ-law/a-law) should be 8000 Hz."
                 )
             elif provider_enc in ("slin16", "linear16", "pcm16"):
                 # Telephony deployments commonly run an internal 16 kHz PCM pipeline; 24 kHz PCM is also supported.
                 # Only warn when configured to an unusual PCM rate.
                 if provider_rate not in (16000, 24000):
                     issues.append(
-                        f"OpenAI provider_input_sample_rate_hz={provider_rate}; for PCM16 use 16000 Hz (telephony) or 24000 Hz (wideband)."
+                        f"Grok provider_input_sample_rate_hz={provider_rate}; for PCM16 use 16000 Hz (telephony) or 24000 Hz (wideband)."
                     )
 
         return issues
@@ -299,7 +318,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             can_negotiate=False,  # Uses static session.update config, not runtime ACK
             # Provider type and audio processing capabilities
             is_full_agent=True,  # Full bidirectional agent (not pipeline component)
-            has_native_vad=True,  # OpenAI Realtime has server-side VAD (turn detection)
+            has_native_vad=True,  # Grok Voice Agent has server-side VAD (turn detection)
             has_native_barge_in=True,  # Handles interruptions via cancel_response
             has_native_aec=False,  # AEC only available on client-side WebRTC paths, not server-side WebSocket
             requires_continuous_audio=True,  # Needs continuous audio for server-side VAD
@@ -307,7 +326,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
     
     def parse_ack(self, event_data: Dict[str, Any]) -> Optional[ProviderCapabilities]:
         """
-        Parse session.updated event from OpenAI Realtime API to extract negotiated formats.
+        Parse session.updated event from Grok Voice Agent API to extract negotiated formats.
         
         Returns capabilities based on provider ACK, or None if not a session.updated event.
         """
@@ -318,14 +337,14 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         try:
             session = event_data.get('session', {})
             
-            # OpenAI session.updated includes input_audio_format and output_audio_format
+            # Grok session.updated includes input_audio_format and output_audio_format
             input_format = session.get('input_audio_format', 'pcm16')
             output_format = session.get('output_audio_format', 'pcm16')
             
-            # OpenAI Realtime API only supports 24kHz
+            # Grok Voice Agent API only supports 24kHz
             sample_rate = 24000
             
-            # Map OpenAI format names to our encoding names
+            # Map xAI format names to our encoding names
             format_map = {
                 'pcm16': 'linear16',
                 'g711_ulaw': 'mulaw',
@@ -336,7 +355,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             output_enc = format_map.get(output_format, output_format)
             
             logger.info(
-                "Parsed OpenAI session.updated ACK",
+                "Parsed Grok session.updated ACK",
                 call_id=self._call_id,
                 input_format=input_format,
                 output_format=output_format,
@@ -353,7 +372,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             )
         except Exception as exc:
             logger.warning(
-                "Failed to parse OpenAI session.updated event",
+                "Failed to parse Grok session.updated event",
                 call_id=self._call_id,
                 error=str(exc),
             )
@@ -361,7 +380,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
 
     async def start_session(self, call_id: str, context: Optional[Dict[str, Any]] = None):
         if not self.config.api_key:
-            raise ValueError("OpenAI Realtime provider requires OPENAI_API_KEY")
+            raise ValueError("Grok Voice Agent provider requires XAI_API_KEY (or per-instance api_key_file)")
 
         await self.stop_session()
         self._call_id = call_id
@@ -373,7 +392,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._transcript_buffer = ""
         self._closing = False
         self._closed = False
-        
+        self._session_started_ts = time.monotonic()
+        self._session_warned_long_session = False
+
         # Initialize session ACK mechanism (similar to Deepgram pattern)
         self._session_ack_event = asyncio.Event()
         self._outfmt_acknowledged = False
@@ -389,28 +410,21 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._reset_output_meter()
 
         url = self._build_ws_url()
-        use_beta = getattr(self.config, 'api_version', 'ga').lower() == 'beta'
         headers = [
             ("Authorization", f"Bearer {self.config.api_key}"),
         ]
-        if use_beta:
-            headers.append(("OpenAI-Beta", "realtime=v1"))
-        if self.config.organization:
-            headers.append(("OpenAI-Organization", self.config.organization))
-        if self.config.project_id:
-            headers.append(("OpenAI-Project", self.config.project_id))
 
-        logger.info("Connecting to OpenAI Realtime", url=url, call_id=call_id, api_version="beta" if use_beta else "ga")
+        logger.info("Connecting to Grok Voice Agent", url=url, call_id=call_id, provider_key=self.provider_key)
         try:
             self.websocket = await websockets.connect(url, additional_headers=headers)
         except Exception:
-            logger.error("Failed to connect to OpenAI Realtime", call_id=call_id, exc_info=True)
+            logger.error("Failed to connect to Grok Voice Agent", call_id=call_id, provider_key=self.provider_key, exc_info=True)
             raise
 
-        # CRITICAL FIX: Wait for session.created before configuring (per OpenAI docs)
+        # CRITICAL FIX: Wait for session.created before configuring (per xAI docs)
         # "The server sends session.created as the first inbound message.
         # session.update sent before session.created is ignored."
-        logger.debug("Waiting for session.created from OpenAI...", call_id=call_id)
+        logger.debug("Waiting for session.created from Grok...", call_id=call_id)
         try:
             first_message = await asyncio.wait_for(
                 self.websocket.recv(),
@@ -437,7 +451,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 "Timeout waiting for session.created",
                 call_id=call_id
             )
-            raise RuntimeError("OpenAI did not send session.created within 5s")
+            raise RuntimeError("Grok did not send session.created within 5s")
         except Exception as exc:
             logger.error(
                 "Error receiving session.created",
@@ -458,12 +472,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         
         # Brief wait for session.updated ACK - now receive loop can process it
-        # Per OpenAI Dec 2024 docs, session config must be applied before response.create
+        # Per Grok Voice Agent docs, session config must be applied before response.create
         try:
-            logger.debug("Waiting for OpenAI session.updated ACK before greeting...", call_id=call_id)
+            logger.debug("Waiting for Grok session.updated ACK before greeting...", call_id=call_id)
             await asyncio.wait_for(self._session_ack_event.wait(), timeout=2.0)  # Short timeout - ACK arrives fast now
             logger.info(
-                "✅ OpenAI session.updated ACK received - session configured",
+                "✅ Grok session.updated ACK received - session configured",
                 call_id=call_id,
                 acknowledged=self._outfmt_acknowledged,
                 output_format=self._provider_output_format,
@@ -471,7 +485,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "⚠️ OpenAI session.updated ACK timeout - proceeding anyway",
+                "⚠️ Grok session.updated ACK timeout - proceeding anyway",
                 call_id=call_id,
                 note="Session may not be fully configured"
             )
@@ -499,10 +513,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         except Exception:
             logger.debug("Failed to reset pacer state on session start", exc_info=True)
 
-        logger.info("OpenAI Realtime session established", call_id=call_id)
+        logger.info("Grok Voice Agent session established", call_id=call_id)
 
     async def send_audio(self, audio_chunk: bytes, sample_rate: int = None, encoding: str = None):
-        """Send audio to OpenAI Realtime API.
+        """Send audio to Grok Voice Agent API.
         
         Args:
             audio_chunk: Audio data bytes
@@ -523,7 +537,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             if not self._input_info_logged:
                 try:
                     logger.info(
-                        "OpenAI input config",
+                        "Grok input config",
                         call_id=self._call_id,
                         input_encoding=self.config.input_encoding,
                         input_sample_rate_hz=self.config.input_sample_rate_hz,
@@ -536,20 +550,37 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     pass
 
             # CRITICAL: Use engine-provided encoding/sample_rate if available
-            # This avoids double conversion and respects the engine's format negotiation
+            # This avoids double conversion and respects the engine's format negotiation.
+            #
+            # Grok accepts audio/pcm (linear16) AND audio/pcmu (8 kHz mu-law) AND audio/pcma
+            # natively in session.update — so when the engine hands us mu-law (telephony
+            # passthrough configuration), forward bytes as-is. The session.update we sent
+            # already declared the right input format to xAI; converting here would break
+            # alignment with what xAI is decoding.
+            provider_enc = (getattr(self.config, "provider_input_encoding", "") or "").lower().strip()
             if encoding and sample_rate:
-                # Engine already converted to correct format via _encode_for_provider
-                # Trust the engine's conversion
-                if encoding.lower().strip() in ("linear16", "pcm16", "slin16"):
+                enc_norm = encoding.lower().strip()
+                if enc_norm in ("linear16", "pcm16", "slin16", "slin"):
+                    # PCM16: pass through (xAI configured for audio/pcm)
+                    pcm16 = audio_chunk
+                    provider_rate = sample_rate
+                elif enc_norm in ("ulaw", "mulaw", "pcmu", "g711_ulaw") and provider_enc in ("ulaw", "mulaw", "pcmu"):
+                    # mu-law passthrough: bytes match what session.update declared (audio/pcmu).
+                    # The variable is still named pcm16 for downstream symmetry but holds raw mu-law.
+                    pcm16 = audio_chunk
+                    provider_rate = sample_rate
+                elif enc_norm in ("alaw", "pcma", "g711_alaw") and provider_enc in ("alaw", "pcma"):
+                    # A-law passthrough: bytes match session.update audio/pcma declaration.
                     pcm16 = audio_chunk
                     provider_rate = sample_rate
                 else:
-                    # Unexpected format - fall back to conversion
+                    # Genuine mismatch (engine format != provider format) — convert.
                     logger.warning(
-                        "OpenAI Realtime: unexpected encoding from engine, converting",
+                        "Grok: engine/provider encoding mismatch, converting",
                         call_id=self._call_id,
-                        encoding=encoding,
-                        sample_rate=sample_rate
+                        engine_encoding=encoding,
+                        engine_sample_rate=sample_rate,
+                        provider_encoding=provider_enc,
                     )
                     pcm16 = self._convert_inbound_audio(audio_chunk)
                     provider_rate = int(getattr(self.config, "provider_input_sample_rate_hz", 0) or 24000)
@@ -562,7 +593,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 return
             
             # ECHO GATING for speakerphone support:
-            # Gate input ONLY while we're outputting real audio from OpenAI.
+            # Gate input ONLY while we're outputting real audio from Grok.
             # The pacer keeps running and emitting silence, so we can't just check _outbuf.
             # Instead, check if pacer has real audio (underruns == 0 means real audio).
             # 
@@ -574,14 +605,14 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             except Exception:
                 pass  # If we can't check, allow input
             
-            # Send audio to OpenAI for processing
+            # Send audio to Grok for processing
             await self._send_audio_to_openai(pcm16)
             
         except ConnectionClosedError:
-            logger.warning("OpenAI Realtime socket closed while sending audio", call_id=self._call_id)
+            logger.warning("Grok socket closed while sending audio", call_id=self._call_id)
             await self._reconnect_with_backoff()
         except Exception:
-            logger.error("Failed to send audio to OpenAI Realtime", call_id=self._call_id, exc_info=True)
+            logger.error("Failed to send audio to Grok", call_id=self._call_id, exc_info=True)
 
     async def cancel_response(self):
         """Cancel any in-progress response generation (for barge-in)."""
@@ -597,7 +628,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 "event_id": f"cancel-{uuid.uuid4()}",
             }
             await self._send_json(cancel_payload)
-            logger.info("Sent response.cancel to OpenAI (barge-in)", call_id=self._call_id)
+            logger.info("Sent response.cancel to Grok (barge-in)", call_id=self._call_id)
             self._pending_response = False
         except Exception:
             logger.error("Failed to send response.cancel", call_id=self._call_id, exc_info=True)
@@ -635,7 +666,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         """
         Wait for the parent response.done before submitting function_call_output.
 
-        OpenAI Realtime's API only commits function_call items to the conversation
+        Grok Voice Agent's API only commits function_call items to the conversation
         on response finalization; submitting either a success or an error
         function_call_output prematurely produces an invalid_tool_call_id rejection
         and, for non-idempotent tools, the LLM may retry with a fresh call_id and
@@ -667,7 +698,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
 
     async def _handle_function_call(self, event_data: Dict[str, Any]):
         """
-        Handle function call request from OpenAI Realtime API.
+        Handle function call request from Grok Voice Agent API.
 
         Routes the function call to the appropriate tool via the tool adapter.
         """
@@ -710,10 +741,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # _await_parent_response_done for the full rationale).
             await self._await_parent_response_done(event_data, function_name=function_name)
 
-            # Send result back to OpenAI
+            # Send result back to Grok
             await self.tool_adapter.send_tool_result(result, context)
 
-            # For hangup_call, create a dedicated farewell response with tools disabled so OpenAI
+            # For hangup_call, create a dedicated farewell response with tools disabled so Grok
             # doesn't recurse into another tool call (which can lead to `farewell_no_audio` hangups).
             if function_name == "hangup_call" and result and result.get("will_hangup"):
                 farewell_text = str(result.get("message") or "").strip()
@@ -791,7 +822,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 error=str(e),
                 exc_info=True
             )
-            # Send error response to OpenAI in correct format
+            # Send error response to Grok in correct format
             try:
                 item = event_data.get("item", {})
                 call_id_field = item.get("call_id")
@@ -819,7 +850,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     }
                     if self.websocket and self.websocket.state.name == "OPEN":
                         await self._send_json(error_response)
-                        logger.info("Sent error response to OpenAI", call_id=call_id_field)
+                        logger.info("Sent error response to Grok", call_id=call_id_field)
             except Exception as send_error:
                 logger.error(f"Failed to send error response: {send_error}")
 
@@ -888,12 +919,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             self._input_resample_state = None
             self._output_resample_state = None
             self._transcript_buffer = ""
-            logger.info("OpenAI Realtime session stopped")
+            logger.info("Grok session stopped")
             self._clear_metrics(previous_call_id)
 
     def get_provider_info(self) -> Dict[str, Any]:
         return {
-            "name": "OpenAIRealtimeProvider",
+            "name": "GrokProvider",
             "type": "cloud",
             "model": self.config.model,
             "voice": self.config.voice,
@@ -934,161 +965,113 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         base = (self.config.base_url or "").strip()
         # Fallback if unresolved placeholders exist or scheme isn't ws/wss
         if base.startswith("${") or not base.startswith(("ws://", "wss://")):
-            logger.warning("Invalid OpenAI base_url in config; falling back to default", base_url=base)
-            base = "wss://api.openai.com/v1/realtime"
+            logger.warning("Invalid Grok base_url in config; falling back to default", base_url=base)
+            base = "wss://api.x.ai/v1/realtime"
         base = base.rstrip("/")
         return f"{base}?model={self.config.model}"
 
     async def _send_session_update(self):
-        # Map config modalities to output_modalities per latest guide
-        output_modalities = [m for m in (self.config.response_modalities or []) if m in ("audio", "text")]
-        if not output_modalities:
-            output_modalities = ["audio"]
+        """Build and send the xAI Grok session.update payload.
 
-        # CRITICAL FIX: Use output_encoding (what OpenAI sends), NOT target_encoding (downstream format)
-        output_enc = (self.config.output_encoding or "linear16").lower()
-        input_enc = (getattr(self.config, "provider_input_encoding", None) or "linear16").lower()
+        xAI shape (per https://docs.x.ai/developers/model-capabilities/audio/voice-agent):
+          - voice, instructions, turn_detection at session level
+          - audio.{input,output}.format with MIME type ("audio/pcm" / "audio/pcmu" /
+            "audio/pcma") and rate
+          - tools array (function tools + optional xAI-native extras)
+        No ``transcription``, no ``output_modalities``, no GA/Beta dialect branching.
+        """
+        output_enc = (self.config.output_encoding or "ulaw").lower()
+        input_enc = (getattr(self.config, "provider_input_encoding", None) or "ulaw").lower()
 
-        if self._is_ga:
-            # GA API: exact schema from official OpenAI API reference (session.created example)
-            # - format objects under audio.input.format / audio.output.format with type + rate
-            # - turn_detection under audio.input.turn_detection
-            # - transcription under audio.input.transcription
-            # - voice under audio.output.voice
-            # - MIME format types: audio/pcm (24kHz), audio/pcmu (8kHz), audio/pcma (8kHz)
-            def _ga_audio_fmt(enc: str) -> str:
-                enc = enc.lower()
-                if enc in ("ulaw", "mulaw", "g711_ulaw", "mu-law"):
-                    return "audio/pcmu"
-                elif enc in ("alaw", "g711_alaw"):
-                    return "audio/pcma"
-                return "audio/pcm"
+        def _grok_audio_fmt(enc: str) -> tuple[str, int]:
+            """Map encoding string → (xAI MIME type, sample rate)."""
+            enc = enc.lower()
+            if enc in ("ulaw", "mulaw", "g711_ulaw", "mu-law"):
+                return ("audio/pcmu", 8000)
+            if enc in ("alaw", "g711_alaw"):
+                return ("audio/pcma", 8000)
+            # PCM16 — use configured rate, default 8000 for μ-law-direct deployments
+            return ("audio/pcm", int(getattr(self.config, "provider_input_sample_rate_hz", 8000) or 8000))
 
-            in_fmt = _ga_audio_fmt(input_enc)
-            out_fmt = _ga_audio_fmt(output_enc)
-            # Rate is tied to format: audio/pcm=24000, audio/pcmu=8000, audio/pcma=8000
-            in_rate = 8000 if in_fmt in ("audio/pcmu", "audio/pcma") else 24000
-            out_rate = 8000 if out_fmt in ("audio/pcmu", "audio/pcma") else 24000
+        in_fmt_type, in_rate = _grok_audio_fmt(input_enc)
+        out_fmt_type, out_rate = _grok_audio_fmt(output_enc)
+        if out_fmt_type == "audio/pcm":
+            # Output rate honors configured value for PCM; μ-law/A-law are fixed 8 kHz.
+            out_rate = int(getattr(self.config, "output_sample_rate_hz", 8000) or 8000)
 
-            # Build audio.input with turn_detection nested inside
-            audio_input: Dict[str, Any] = {
-                "format": {"type": in_fmt, "rate": in_rate},
-                "transcription": {"model": "whisper-1"},
-            }
-            # turn_detection lives under audio.input per official GA schema
-            td_config: Dict[str, Any] = {
-                "type": "server_vad",
-                "create_response": True,
-                "interrupt_response": True,
-            }
-            if getattr(self.config, "turn_detection", None):
-                try:
-                    td = self.config.turn_detection
-                    td_config.update({
-                        "type": td.type,
-                        "silence_duration_ms": td.silence_duration_ms,
-                        "threshold": td.threshold,
-                        "prefix_padding_ms": td.prefix_padding_ms,
-                    })
-                except Exception:
-                    logger.debug("Failed to build turn_detection for GA", call_id=self._call_id, exc_info=True)
-            audio_input["turn_detection"] = td_config
+        session: Dict[str, Any] = {
+            "voice": self.config.voice,
+            "audio": {
+                "input":  {"format": {"type": in_fmt_type,  "rate": in_rate}},
+                "output": {"format": {"type": out_fmt_type, "rate": out_rate}},
+            },
+        }
 
-            # GA: always request audio/pcm @ 24kHz output — engine transcodes downstream
-            # (audio/pcmu output may be silently ignored by some models)
-            session: Dict[str, Any] = {
-                "type": "realtime",
-                "output_modalities": ["audio"],
-                "audio": {
-                    "input": audio_input,
-                    "output": {
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                        "voice": self.config.voice,
-                    },
-                },
-            }
-        else:
-            # Beta API: flat format strings (pcm16, g711_ulaw, g711_alaw)
-            def _beta_audio_fmt(enc: str) -> str:
-                enc = enc.lower()
-                if enc in ("ulaw", "mulaw", "g711_ulaw", "mu-law"):
-                    return "g711_ulaw"
-                elif enc in ("alaw", "g711_alaw"):
-                    return "g711_alaw"
-                return "pcm16"
+        # turn_detection at session level (xAI shape, NOT nested under audio.input)
+        td_config: Dict[str, Any] = {
+            "type": "server_vad",
+            "threshold": 0.5,
+            "silence_duration_ms": 200,
+            "prefix_padding_ms": 200,
+        }
+        if getattr(self.config, "turn_detection", None):
+            try:
+                td = self.config.turn_detection
+                td_config = {
+                    "type": td.type,
+                    "threshold": td.threshold,
+                    "silence_duration_ms": td.silence_duration_ms,
+                    "prefix_padding_ms": td.prefix_padding_ms,
+                }
+                logger.info(
+                    "Using custom turn_detection config from YAML",
+                    call_id=self._call_id,
+                    threshold=td.threshold,
+                    silence_ms=td.silence_duration_ms,
+                    provider_key=self.provider_key,
+                )
+            except Exception:
+                logger.debug("Failed to build turn_detection; using defaults", call_id=self._call_id, exc_info=True)
+        session["turn_detection"] = td_config
 
-            in_fmt = _beta_audio_fmt(input_enc)
-            out_fmt = _beta_audio_fmt(output_enc)
-
-            session: Dict[str, Any] = {
-                "modalities": output_modalities,
-                "input_audio_format": in_fmt,
-                "output_audio_format": out_fmt,
-                "voice": self.config.voice,
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-            }
-            # Beta: turn_detection at session level
-            if getattr(self.config, "turn_detection", None):
-                try:
-                    td = self.config.turn_detection
-                    session["turn_detection"] = {
-                        "type": td.type,
-                        "silence_duration_ms": td.silence_duration_ms,
-                        "threshold": td.threshold,
-                        "prefix_padding_ms": td.prefix_padding_ms,
-                    }
-                    logger.info(
-                        "Using custom turn_detection config from YAML",
-                        call_id=self._call_id,
-                        threshold=td.threshold,
-                        silence_ms=td.silence_duration_ms,
-                    )
-                except Exception:
-                    logger.debug("Failed to include turn_detection in session.update", call_id=self._call_id, exc_info=True)
-        
-        # GA API requires session type
-        self._ga_session_type(session)
-        
-        # Optional: Add temperature control (affects response creativity and consistency)
-        if hasattr(self.config, 'temperature') and self.config.temperature is not None:
-            session["temperature"] = self.config.temperature
-        
-        # Optional: Add max response tokens (encourages complete audio responses)
-        if hasattr(self.config, 'max_response_output_tokens') and self.config.max_response_output_tokens:
-            session["max_response_output_tokens"] = self.config.max_response_output_tokens
-
-        # Build instructions with audio-forcing prefix
-        # CRITICAL: Per OpenAI community reports (Dec 2024), the Realtime API has a bug
-        # where modalities can get "stuck" on text-only after any text exchange.
-        # Adding explicit audio instructions helps force audio output.
+        # Instructions with audio-forcing prefix (defensive — matches OpenAI pattern (Grok inherits this behavior))
         audio_forcing_prefix = (
             "IMPORTANT: You are a voice-based AI assistant. "
             "ALWAYS respond with AUDIO speech, never text-only. "
             "Every response MUST include spoken audio output. "
         )
-        
         if self.config.instructions:
             session["instructions"] = audio_forcing_prefix + self.config.instructions
         else:
             session["instructions"] = audio_forcing_prefix
 
-        # Add tool calling configuration (context allowlist only)
+        # Tools: custom function tools from adapter, plus optional xAI-native extras
+        # (web_search, x_search, file_search, mcp) from config.extra_tools (YAML-only).
         try:
             tools = self.tool_adapter.get_tools_config(list(self._allowed_tools or []))
-            if tools:
-                session["tools"] = tools
-                session["tool_choice"] = "auto"  # Let OpenAI decide when to call tools
-                logger.info(
-                    f"🛠️  OpenAI session configured with {len(tools)} tools",
-                    call_id=self._call_id,
-                )
         except Exception as e:
             logger.warning(
-                f"Failed to add tools to OpenAI session: {e}",
+                f"Failed to build Grok function tools: {e}",
                 call_id=self._call_id,
                 exc_info=True,
+                provider_key=self.provider_key,
+            )
+            tools = []
+        extra_tools = list(getattr(self.config, "extra_tools", None) or [])
+        if extra_tools:
+            tools = tools + extra_tools
+            logger.info(
+                f"🧩 Grok session includes {len(extra_tools)} xAI-native extra tools",
+                call_id=self._call_id,
+                provider_key=self.provider_key,
+            )
+        if tools:
+            session["tools"] = tools
+            session["tool_choice"] = "auto"
+            logger.info(
+                f"🛠️  Grok session configured with {len(tools)} tools",
+                call_id=self._call_id,
+                provider_key=self.provider_key,
             )
 
         payload: Dict[str, Any] = {
@@ -1097,13 +1080,16 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             "session": session,
         }
 
-        # DEBUG: Log what we're actually sending to OpenAI
         logger.info(
-            "OpenAI session.update payload",
+            "Grok session.update payload",
             call_id=self._call_id,
-            output_audio_format=session.get("output_audio_format"),
-            input_audio_format=session.get("input_audio_format"),
-            modalities=session.get("modalities"),
+            provider_key=self.provider_key,
+            input_format=in_fmt_type,
+            input_rate=in_rate,
+            output_format=out_fmt_type,
+            output_rate=out_rate,
+            voice=self.config.voice,
+            tool_count=len(tools) if tools else 0,
         )
 
         await self._send_json(payload)
@@ -1113,7 +1099,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         if not greeting or not self.websocket or self.websocket.state.name != "OPEN":
             return
 
-        # Per OpenAI Dec 2024 docs: Disable turn_detection during greeting
+        # Per Grok Voice Agent docs: Disable turn_detection during greeting
         # to prevent user speech from interrupting the greeting
         logger.info(
             "🔇 Disabling turn_detection for greeting playback",
@@ -1203,7 +1189,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         if not self.websocket or self.websocket.state.name != "OPEN":
             return
         
-        # Build turn_detection config from YAML or use OpenAI defaults
+        # Build turn_detection config from YAML or use Grok defaults
         turn_detection_config = None
         if getattr(self.config, "turn_detection", None):
             try:
@@ -1215,7 +1201,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     "prefix_padding_ms": td.prefix_padding_ms,
                 }
             except Exception:
-                logger.debug("Failed to build turn_detection config, using OpenAI defaults", 
+                logger.debug("Failed to build turn_detection config, using Grok defaults", 
                            call_id=self._call_id, exc_info=True)
         
         # GA API does not accept turn_detection in session.update; skip entirely
@@ -1225,13 +1211,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 call_id=self._call_id,
             )
         else:
-            # If no config in YAML, let OpenAI use its defaults by not setting the field
+            # If no config in YAML, let Grok use its defaults by not setting the field
             # This is better than hardcoding default values
             session_update = {}
             if turn_detection_config:
                 session_update["turn_detection"] = turn_detection_config
             else:
-                # Use OpenAI's default server_vad configuration
+                # Use Grok's default server_vad configuration
                 session_update["turn_detection"] = {"type": "server_vad"}
             
             enable_vad_payload: Dict[str, Any] = {
@@ -1244,7 +1230,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             logger.info(
                 "🔊 Turn_detection re-enabled after greeting",
                 call_id=self._call_id,
-                config=turn_detection_config if turn_detection_config else "OpenAI defaults"
+                config=turn_detection_config if turn_detection_config else "Grok defaults"
             )
 
     async def _ensure_response_request(self):
@@ -1268,7 +1254,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._pending_response = True
 
     def _start_farewell_timeout(self):
-        """Start a 5-second timeout to ensure hangup happens even if OpenAI doesn't generate audio."""
+        """Start a 5-second timeout to ensure hangup happens even if Grok doesn't generate audio."""
         # Cancel any existing timeout first
         self._cancel_farewell_timeout()
         
@@ -1296,7 +1282,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             
             # If we reach here, timeout expired without being cancelled
             logger.warning(
-                "⏱️  Farewell timeout expired - OpenAI did not generate audio within 5s, triggering hangup anyway",
+                "⏱️  Farewell timeout expired - Grok did not generate audio within 5s, triggering hangup anyway",
                 call_id=self._call_id
             )
             
@@ -1334,7 +1320,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         try:
             ptype = payload.get("type")
             if ptype and not ptype.startswith("input_audio_buffer."):
-                logger.debug("OpenAI send", call_id=self._call_id, type=ptype)
+                logger.debug("Grok send", call_id=self._call_id, type=ptype)
         except Exception:
             pass
         message = json.dumps(payload)
@@ -1345,7 +1331,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         """
         Cancel an in-progress response when user interrupts (barge-in).
         
-        This implements the OpenAI Realtime API's response.cancel event,
+        This implements the Grok Voice Agent API's response.cancel event,
         which stops audio generation and discards remaining chunks when
         the user starts speaking during an AI response.
         
@@ -1362,12 +1348,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             }
             await self._send_json(cancel_payload)
             logger.debug(
-                "Sent response.cancel to OpenAI",
+                "Sent response.cancel to Grok",
                 call_id=self._call_id,
                 response_id=response_id
             )
             # Local egress can have buffered audio (pacer/outbuf). Flush it immediately so the interrupted
-            # sentence does not resume locally even if OpenAI continues sending a few in-flight frames.
+            # sentence does not resume locally even if Grok continues sending a few in-flight frames.
             try:
                 await self._emit_audio_done()
             except Exception:
@@ -1385,7 +1371,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 logger.debug("Failed stopping pacer during barge-in cancel", call_id=self._call_id, exc_info=True)
         except Exception:
             logger.error(
-                "Failed to cancel OpenAI response",
+                "Failed to cancel Grok response",
                 call_id=self._call_id,
                 response_id=response_id,
                 exc_info=True
@@ -1395,7 +1381,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         """Notify the engine that provider-side VAD detected user interruption.
 
         Engine uses this to flush local playback immediately (Option 2),
-        while OpenAI remains responsible for response cancellation/turn-taking.
+        while Grok remains responsible for response cancellation/turn-taking.
         """
         try:
             now = time.time()
@@ -1414,7 +1400,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             logger.debug("Failed to emit ProviderBargeIn", call_id=self._call_id, exc_info=True)
     
     async def _send_audio_to_openai(self, pcm16: bytes):
-        """Helper method to send PCM16 audio to OpenAI (extracted for gating logic).
+        """Helper method to send PCM16 audio to Grok (extracted for gating logic).
         
         This contains the actual audio sending logic that was previously inline in send_audio.
         It handles both VAD-enabled and manual commit modes.
@@ -1422,7 +1408,16 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         # Turn start tracking moved to response.done event to count conversational turns correctly
         
         # If server VAD is enabled, just append frames; do not commit.
-        vad_enabled = getattr(self.config, "turn_detection", None) is not None
+        # NOTE: _send_session_update always sends a default server_vad turn_detection
+        # block (see line ~1011), so VAD is effectively enabled even when YAML omits it.
+        # The previous check `config.turn_detection is not None` caused the manual
+        # batching branch to run with default configs, which buffered sub-threshold
+        # tail audio and clipped utterance endings. Treat VAD as enabled unless the
+        # operator has explicitly disabled it via _vad_disabled_for_greeting or sets
+        # turn_detection to a falsy value.
+        td = getattr(self.config, "turn_detection", None)
+        vad_explicitly_disabled = td is not None and getattr(td, "type", None) in (None, "none", "off", "disabled")
+        vad_enabled = not vad_explicitly_disabled
         if vad_enabled:
             try:
                 audio_b64 = base64.b64encode(pcm16).decode("ascii")
@@ -1446,12 +1441,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         await self._send_json({"type": "input_audio_buffer.append", "audio": audio_b64})
                         # CRITICAL FIX #2: Do NOT manually commit input audio buffer
                         # Manual commits caused 310 "buffer too small" errors (40% failure rate)
-                        # OpenAI automatically commits when speech_stopped is detected (per API design)
-                        # Removes empty buffer errors and lets OpenAI handle turn-taking naturally
+                        # Grok automatically commits when speech_stopped is detected (per API design)
+                        # Removes empty buffer errors and lets Grok handle turn-taking naturally
                         # await self._send_json({"type": "input_audio_buffer.commit"})
                         self._last_commit_ts = time.monotonic()
                         logger.info(
-                            "OpenAI appended input audio (auto-commit on speech_stopped)",
+                            "Grok appended input audio (auto-commit on speech_stopped)",
                             call_id=self._call_id,
                             ms=len(chunk) // bytes_per_ms,
                             bytes=len(chunk),
@@ -1459,9 +1454,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     except Exception:
                         logger.error("Failed to append input audio buffer", call_id=self._call_id, exc_info=True)
                     # CRITICAL FIX: Do NOT manually trigger response.create after every audio commit
-                    # OpenAI's server_vad automatically generates responses when user stops speaking
+                    # Grok's server_vad automatically generates responses when user stops speaking
                     # Calling _ensure_response_request() here caused 148 requests in 70s (spam!)
-                    # Let OpenAI handle turn-taking naturally
+                    # Let Grok handle turn-taking naturally
 
     def _convert_inbound_audio(self, audio_chunk: bytes) -> Optional[bytes]:
         fmt_raw = getattr(self.config, "input_encoding", None) or "slin16"
@@ -1482,7 +1477,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             "pcm16",
         }
         if fmt not in valid_encodings:
-            logger.warning("Unsupported input encoding for OpenAI Realtime", encoding=fmt_raw)
+            logger.warning("Unsupported input encoding for Grok", encoding=fmt_raw)
             fmt = "slin16"
             try:
                 self.config.input_encoding = fmt
@@ -1531,7 +1526,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     rms_swapped = 0
                 try:
                     logger.info(
-                        "OpenAI inbound PCM16 probe",
+                        "Grok inbound PCM16 probe",
                         call_id=self._call_id,
                         rms_native=rms_native,
                         rms_swapped=rms_swapped,
@@ -1569,15 +1564,15 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 try:
                     event = json.loads(message)
                 except json.JSONDecodeError:
-                    logger.warning("Failed to decode OpenAI Realtime payload", payload_preview=message[:64])
+                    logger.warning("Failed to decode Grok payload", payload_preview=message[:64])
                     continue
                 await self._handle_event(event)
         except asyncio.CancelledError:
             pass
         except (ConnectionClosedError, ConnectionClosedOK):
-            logger.info("OpenAI Realtime connection closed", call_id=self._call_id)
+            logger.info("Grok connection closed", call_id=self._call_id)
         except Exception:
-            logger.error("OpenAI Realtime receive loop error", call_id=self._call_id, exc_info=True)
+            logger.error("Grok receive loop error", call_id=self._call_id, exc_info=True)
         finally:
             await self._emit_audio_done()
             self._pending_response = False
@@ -1586,7 +1581,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     if not self._reconnect_task or self._reconnect_task.done():
                         self._reconnect_task = asyncio.create_task(self._reconnect_with_backoff())
             except Exception:
-                logger.debug("Failed to schedule OpenAI reconnect", call_id=self._call_id, exc_info=True)
+                logger.debug("Failed to schedule Grok reconnect", call_id=self._call_id, exc_info=True)
 
     async def _handle_event(self, event: Dict[str, Any]):
         event_type = event.get("type")
@@ -1607,7 +1602,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 )
                 return
 
-            # Known-benign race in the OpenAI Realtime GA API: after we submit
+            # Known-benign race (inherited from OpenAI Realtime parent — see SYNC comment): after we submit
             # conversation.item.create(function_call_output), the server occasionally
             # reports "Tool call ID ... not found in conversation" because the
             # function_call item from the just-completed response hasn't finished
@@ -1623,7 +1618,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             # stay at ERROR level so it's visible in logs/metrics.
             if error_code == "invalid_tool_call_id":
                 # Extract the rejected call_id from the message so we can correlate.
-                # OpenAI's message format: "Tool call ID 'call_...' not found in conversation."
+                # Server message format: "Tool call ID 'call_...' not found in conversation."
                 import re as _re
                 rejected_call_id = None
                 try:
@@ -1634,7 +1629,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     rejected_call_id = None
                 if rejected_call_id and self._is_recent_tool_call_id(rejected_call_id):
                     logger.warning(
-                        "OpenAI rejected tool_call_id linkage (benign race — audio response still succeeds)",
+                        "Grok rejected tool_call_id linkage (benign race — audio response still succeeds)",
                         call_id=self._call_id,
                         error_code=error_code,
                         rejected_call_id=rejected_call_id,
@@ -1643,7 +1638,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     return
                 # Unknown call_id — don't mask a real failure.
                 logger.error(
-                    "OpenAI rejected tool_call_id with NO recent matching submission",
+                    "Grok rejected tool_call_id with NO recent matching submission",
                     call_id=self._call_id,
                     error_code=error_code,
                     rejected_call_id=rejected_call_id,
@@ -1652,7 +1647,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 return
 
             # Log other errors
-            logger.error("OpenAI Realtime error event", call_id=self._call_id, error_event=event)
+            logger.error("Grok error event", call_id=self._call_id, error_event=event)
             return
 
         if event_type == "response.created":
@@ -1683,12 +1678,12 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         call_id=self._call_id,
                         response_id=response_id
                     )
-                    # Start fallback timeout in case OpenAI doesn't generate audio
+                    # Start fallback timeout in case Grok doesn't generate audio
                     self._start_farewell_timeout()
                     # Wait for output_audio.done before emitting HangupReady so we don't cut off speech.
                     self._farewell_waiting_for_audio_done = True
                 else:
-                    logger.debug("OpenAI response created", call_id=self._call_id, response_id=response_id)
+                    logger.debug("Grok response created", call_id=self._call_id, response_id=response_id)
             return
 
         if event_type == "response.delta":
@@ -1827,9 +1822,9 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 )
             
             if event_type == "response.error":
-                logger.error("OpenAI Realtime response error", call_id=self._call_id, error=event.get("error"))
+                logger.error("Grok response error", call_id=self._call_id, error=event.get("error"))
             elif event_type == "response.cancelled":
-                logger.info("OpenAI response cancelled (barge-in)", call_id=self._call_id, response_id=self._current_response_id)
+                logger.info("Grok response cancelled (barge-in)", call_id=self._call_id, response_id=self._current_response_id)
             
             # Re-enable VAD when greeting response completes
             # response.done fires when entire response is generated (not per-segment)
@@ -1936,6 +1931,8 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 await self._emit_transcript(transcript, is_final=True)
                 # Track user conversation for email tools and call history
                 await self._track_conversation("user", transcript)
+                # Remember most recent user turn for end-of-call fallback (see _track_conversation).
+                self._last_final_user_text = transcript
             return
         
         if event_type == "conversation.item.input_audio_transcription.failed":
@@ -1952,6 +1949,14 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         if event_type == "response.output_text.delta":
             delta = event.get("delta") or {}
             text = delta.get("text")
+            if text:
+                await self._emit_transcript(text, is_final=False)
+            return
+
+        # xAI's native text-delta event name (vs OpenAI's response.output_text.delta).
+        # Payload places ``text`` at the top level of the event, not inside ``delta``.
+        if event_type == "response.text.delta":
+            text = event.get("text") or (event.get("delta") or {}).get("text")
             if text:
                 await self._emit_transcript(text, is_final=False)
             return
@@ -2005,6 +2010,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             else:
                 # IMPORTANT: even when there's no cancellable response (e.g., output buffered locally),
                 # we still want the platform to flush local playback immediately on speech_started.
+                # This mirrors openai_realtime.py's behavior exactly — battle-tested in production
+                # across OpenAI Realtime, and Grok is wire-compatible with that. Earlier attempts
+                # at softer barge-in (keep tail / drop only provider burst) felt sluggish on
+                # speakerphone — caller couldn't get a word in. The full flush is the right
+                # interaction model for telephony.
                 if event_type == "input_audio_buffer.speech_started":
                     # Never interrupt the greeting turn via platform flush.
                     if self._greeting_response_id and not self._greeting_completed:
@@ -2016,17 +2026,17 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     else:
                         # AudioSocket+streaming: a response can be "done" at the provider while
                         # we're still draining buffered audio locally (pacer/outbuf).
-                        # If the caller starts speaking, we must stop emitting any remaining buffered
-                        # audio immediately so the next turn can proceed normally.
+                        # If the caller starts speaking, we must stop emitting any remaining
+                        # buffered audio immediately so the next turn can proceed normally.
                         try:
                             async with self._pacer_lock:
                                 self._outbuf.clear()
                         except Exception:
-                            logger.debug("Failed to clear OpenAI egress buffer on barge-in", call_id=self._call_id, exc_info=True)
+                            logger.debug("Failed to clear Grok egress buffer on barge-in", call_id=self._call_id, exc_info=True)
                         try:
                             await self._emit_audio_done()
                         except Exception:
-                            logger.debug("Failed to stop OpenAI egress pacer on barge-in", call_id=self._call_id, exc_info=True)
+                            logger.debug("Failed to stop Grok egress pacer on barge-in", call_id=self._call_id, exc_info=True)
                         logger.info(
                             "🎤 User speech started (no active response); requesting platform flush",
                             call_id=self._call_id,
@@ -2034,7 +2044,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                         )
                         await self._emit_provider_barge_in(event_type=event_type)
                 else:
-                    logger.info("OpenAI input_audio_buffer ack", call_id=self._call_id, event_type=event_type)
+                    logger.info("Grok input_audio_buffer ack", call_id=self._call_id, event_type=event_type)
             return
 
         # Additional transcript variants per guide
@@ -2063,7 +2073,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 input_format = session.get("input_audio_format", "pcm16")
                 output_format = session.get("output_audio_format", "pcm16")
                 
-                # Map OpenAI format names to internal format names and sample rates
+                # Map xAI format names to internal format names and sample rates
                 format_map = {
                     'pcm16': ('pcm16', 24000),
                     'g711_ulaw': ('g711_ulaw', 8000),
@@ -2077,7 +2087,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     self._outfmt_acknowledged = True
                 
                 logger.info(
-                    "✅ OpenAI session.updated ACK received",
+                    "✅ Grok session.updated ACK received",
                     call_id=self._call_id,
                     input_format=input_format,
                     output_format=output_format,
@@ -2099,7 +2109,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             return
 
         # Handle function calls from response.output_item.done events
-        # This is the correct event per OpenAI Realtime API spec
+        # This is the correct event per Grok Voice Agent API spec
         if event_type == "response.output_item.done":
             item = event.get("item", {})
             if item.get("type") == "function_call":
@@ -2109,7 +2119,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 # the tool handler. The handler will await this event before submitting
                 # function_call_output, so the parent response has time to commit to the
                 # conversation on the server side. Without this, fast tools race ahead of
-                # response.done and OpenAI rejects the output with invalid_tool_call_id.
+                # response.done and Grok rejects the output with invalid_tool_call_id.
                 resp_id = event.get("response_id") or self._current_response_id
                 if resp_id and resp_id not in self._response_done_events:
                     self._response_done_events[resp_id] = asyncio.Event()
@@ -2118,7 +2128,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 if call_id_field:
                     self._record_recent_tool_call_id(call_id_field)
                 logger.info(
-                    "📞 OpenAI function call detected",
+                    "📞 Grok function call detected",
                     call_id=self._call_id,
                     function_call_id=call_id_field,
                     function_name=function_name,
@@ -2131,18 +2141,18 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 task.add_done_callback(self._background_tasks.discard)
             return
 
-        logger.debug("Unhandled OpenAI Realtime event", event_type=event_type)
+        logger.debug("Unhandled Grok Voice Agent event", event_type=event_type)
 
     async def _handle_output_audio(self, audio_b64: str):
         try:
             raw_bytes = base64.b64decode(audio_b64)
         except Exception:
-            logger.warning("Invalid base64 audio payload from OpenAI", call_id=self._call_id)
+            logger.warning("Invalid base64 audio payload from Grok", call_id=self._call_id)
             return
 
         if not raw_bytes:
             return
-        
+
         # Mark audio observed for this response id (used for reliable hangup behavior).
         try:
             if self._current_response_id:
@@ -2192,38 +2202,37 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         ):
             outbound = raw_bytes
         else:
-            # Otherwise, normalize to PCM16 using either ACK'ed format or inferred format, then convert
+            # Otherwise, normalize to PCM16 using either ACK'ed format or our declared format, then convert.
             effective_fmt = self._provider_output_format
             if not self._outfmt_acknowledged:
-                # Heuristic inference when ACK missing: prefer μ-law if odd length or RMS-ulaw >> RMS-pcm
-                inferred = None
-                try:
-                    l = len(raw_bytes)
-                    if l % 2 == 1:
-                        inferred = "ulaw"
-                    else:
-                        # Compare RMS when treated as PCM16 vs μ-law→PCM16 on a small window
-                        win_pcm = raw_bytes[: min(640, l - (l % 2))]
-                        rms_pcm = audioop.rms(win_pcm, 2) if win_pcm else 0
-                        try:
-                            win_mulaw_pcm16 = mulaw_to_pcm16le(raw_bytes[: min(320, l)])
-                        except Exception:
-                            win_mulaw_pcm16 = b""
-                        rms_ulaw = audioop.rms(win_mulaw_pcm16, 2) if win_mulaw_pcm16 else 0
-                        if rms_ulaw > max(50, int(1.5 * (rms_pcm or 1))):
-                            inferred = "ulaw"
-                        else:
-                            inferred = "pcm16"
-                except Exception:
-                    inferred = None
-                self._inferred_provider_encoding = inferred or self._inferred_provider_encoding or "pcm16"
-                effective_fmt = self._inferred_provider_encoding
+                # xAI does NOT send session.updated ACK (observed empirically on live voiprnd calls
+                # 2026-05-22). Per the xAI Voice Agent docs the default output is "24 kHz PCM" and
+                # per-session output_format declarations are accepted. So trust our session.update
+                # declaration as authoritative.
+                #
+                # The prior RMS-fingerprint heuristic (compare ulaw-decoded RMS vs raw-pcm16 RMS) was
+                # unreliable: μ-law's logarithmic decode amplifies mid-range bytes regardless of source
+                # content, biasing the result toward "ulaw" for speech-shaped data. That caused
+                # pcm16-@-24kHz bytes to be mis-decoded as μ-law → garbled playback.
+                configured_enc = (self.config.output_encoding or "").lower().strip()
+                if configured_enc in ("linear16", "pcm16", "slin16", "slin"):
+                    declared_fmt = "pcm16"
+                elif configured_enc in ("ulaw", "mulaw", "g711_ulaw", "mu-law"):
+                    declared_fmt = "ulaw"
+                elif configured_enc in ("alaw", "g711_alaw"):
+                    declared_fmt = "alaw"
+                else:
+                    declared_fmt = "pcm16"  # xAI documented default
+                self._inferred_provider_encoding = declared_fmt
+                effective_fmt = declared_fmt
                 if not self._inference_logged:
                     try:
                         logger.info(
-                            "OpenAI output format not ACKed; using inferred decode path",
+                            "Grok output format not ACKed; trusting session.update declaration",
                             call_id=self._call_id,
-                            inferred=effective_fmt,
+                            declared=effective_fmt,
+                            configured_output_encoding=configured_enc,
+                            configured_output_sample_rate_hz=getattr(self.config, "output_sample_rate_hz", None),
                             bytes=len(raw_bytes),
                         )
                     except Exception:
@@ -2236,7 +2245,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     "⚠️ Processing audio without format ACK - using inference fallback",
                     call_id=self._call_id,
                     inferred_format=effective_fmt,
-                    note="Audio quality may be degraded. OpenAI should send session.updated ACK."
+                    note="Audio quality may be degraded. Grok should send session.updated ACK."
                 )
             
             # Decode to PCM16 according to effective format
@@ -2283,7 +2292,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             if self.on_event:
                 if not self._first_output_chunk_logged:
                     logger.info(
-                        "OpenAI Realtime first audio chunk",
+                        "Grok first audio chunk",
                         call_id=self._call_id,
                         bytes=len(outbound),
                         target_encoding=self.config.target_encoding,
@@ -2404,18 +2413,57 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     text_preview=text[:50] + "..." if len(text) > 50 else text
                 )
                 
-                # Fallback detection: Warn if AI naturally ends conversation without using hangup_call
-                if role == "assistant" and not self._hangup_after_response:
-                    text_lower = text.lower()
-                    ending_phrases = [
-                        "goodbye", "bye", "see you", "talk to you later", "take care",
-                        "have a great day", "have a good day", "have a nice day"
-                    ]
-                    if any(phrase in text_lower for phrase in ending_phrases):
+                # End-of-call fallback: if Grok speaks a clear farewell but never invokes the
+                # hangup_call tool (observed pattern on call 1779495102.759: model said goodbye
+                # three times in a row without ever calling the tool), arm cleanup_after_tts on
+                # the session so the engine hangs up cleanly once the audio finishes playing.
+                # Requires BOTH user AND assistant to signal end-of-call to avoid premature hangup
+                # mid-conversation. Mirrors the pattern in google_live._maybe_arm_cleanup_after_tts.
+                if (
+                    role == "assistant"
+                    and not self._hangup_after_response
+                    and not self._hangup_fallback_armed
+                ):
+                    assistant_lower = (text or "").lower()
+                    user_lower = (self._last_final_user_text or "").lower()
+                    assistant_farewell = any(
+                        phrase in assistant_lower for phrase in (
+                            "goodbye", "good bye", "have a great day", "have a good day",
+                            "have a nice day", "take care", "talk to you later", "see you",
+                            "the call will end", "i'll hang up", "ill hang up", "ending the call",
+                        )
+                    )
+                    user_farewell = any(
+                        phrase in user_lower for phrase in (
+                            "goodbye", "good bye", "bye", "thank you. goodbye", "thanks goodbye",
+                            "that's all", "thats all", "hang up", "end the call", "end call",
+                            "no thank you", "no thanks",
+                        )
+                    )
+                    if assistant_farewell and user_farewell:
+                        try:
+                            session.cleanup_after_tts = True
+                            await self._session_store.upsert_call(session)
+                            self._hangup_fallback_armed = True
+                            logger.info(
+                                "🔚 Armed cleanup_after_tts (assistant + user farewell, no hangup_call tool)",
+                                call_id=self._call_id,
+                                user_hint=self._last_final_user_text[:80],
+                                assistant_hint=text[:80],
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to arm cleanup_after_tts fallback",
+                                call_id=self._call_id,
+                                exc_info=True,
+                            )
+                    elif assistant_farewell:
+                        # Just log the mismatch; don't arm hangup if user didn't signal end.
                         logger.warning(
-                            "⚠️  AI used farewell phrase without invoking hangup_call tool",
+                            "⚠️  AI used farewell phrase without invoking hangup_call tool (user end-intent not detected)",
                             call_id=self._call_id,
-                            text_preview=text[:100]
+                            text_preview=text[:100],
+                            last_user=self._last_final_user_text[:80],
                         )
             else:
                 logger.warning(
@@ -2446,10 +2494,32 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 except asyncio.CancelledError:
                     break
                 except Exception:
-                    logger.debug("OpenAI Realtime keepalive failed", call_id=self._call_id, exc_info=True)
+                    logger.debug("Grok keepalive failed", call_id=self._call_id, exc_info=True)
                     break
+                # 30-min session cap warning: xAI closes the socket at the 30-min mark.
+                # Emit one structured warning at the configured threshold (default 28 min)
+                # so operators can correlate call drops with this documented limit.
+                self._maybe_warn_long_session()
         except asyncio.CancelledError:
             pass
+
+    def _maybe_warn_long_session(self) -> None:
+        if self._session_warned_long_session or not self._session_started_ts:
+            return
+        threshold = float(getattr(self.config, "session_warn_after_seconds", 28 * 60) or 0)
+        if threshold <= 0:
+            return
+        elapsed = time.monotonic() - self._session_started_ts
+        if elapsed < threshold:
+            return
+        self._session_warned_long_session = True
+        logger.warning(
+            "Grok session approaching documented 30-min cap — xAI will close the socket soon",
+            call_id=self._call_id,
+            provider_key=self.provider_key,
+            elapsed_seconds=int(elapsed),
+            threshold_seconds=int(threshold),
+        )
 
     async def _reconnect_with_backoff(self):
         call_id = self._call_id
@@ -2474,17 +2544,10 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 return
             try:
                 url = self._build_ws_url()
-                use_beta = getattr(self.config, 'api_version', 'ga').lower() == 'beta'
                 headers = [
                     ("Authorization", f"Bearer {self.config.api_key}"),
                 ]
-                if use_beta:
-                    headers.append(("OpenAI-Beta", "realtime=v1"))
-                if self.config.organization:
-                    headers.append(("OpenAI-Organization", self.config.organization))
-                if self.config.project_id:
-                    headers.append(("OpenAI-Project", self.config.project_id))
-                logger.info("Reconnecting to OpenAI Realtime", call_id=call_id, attempt=attempt)
+                logger.info("Reconnecting to Grok Voice Agent", call_id=call_id, attempt=attempt, provider_key=self.provider_key)
                 self.websocket = await websockets.connect(url, additional_headers=headers)
                 # Reset minor state
                 self._pending_response = False
@@ -2495,16 +2558,16 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 self._log_session_assumptions()
                 self._receive_task = asyncio.create_task(self._receive_loop())
                 self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-                logger.info("OpenAI Realtime reconnected", call_id=call_id)
+                logger.info("Grok Voice Agent reconnected", call_id=call_id, provider_key=self.provider_key)
                 return
             except Exception:
-                logger.warning("OpenAI Realtime reconnect failed", call_id=call_id, attempt=attempt, exc_info=True)
+                logger.warning("Grok Voice Agent reconnect failed", call_id=call_id, attempt=attempt, provider_key=self.provider_key, exc_info=True)
                 try:
                     await asyncio.sleep(backoff)
                 except asyncio.CancelledError:
                     return
                 backoff = min(6.0, backoff * 2)
-        logger.error("OpenAI Realtime reconnection exhausted attempts", call_id=call_id)
+        logger.error("Grok Voice Agent reconnection exhausted attempts", call_id=call_id, provider_key=self.provider_key)
 
     # ------------------------------------------------------------------ #
     # Metrics and session metadata helpers ------------------------------ #
@@ -2528,7 +2591,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
 
         assumed_output = int(getattr(self.config, "output_sample_rate_hz", 0) or 0)
         try:
-            _OPENAI_ASSUMED_OUTPUT_RATE.set(assumed_output)
+            _GROK_ASSUMED_OUTPUT_RATE.set(assumed_output)
         except Exception:
             pass
 
@@ -2544,13 +2607,13 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         }
 
         try:
-            _OPENAI_SESSION_AUDIO_INFO.info(info_payload)
+            _GROK_SESSION_AUDIO_INFO.info(info_payload)
         except Exception:
             pass
 
         try:
             logger.info(
-                "OpenAI Realtime session assumptions",
+                "Grok session assumptions",
                 call_id=call_id,
                 input_encoding=info_payload["input_encoding"],
                 input_sample_rate_hz=info_payload["input_sample_rate_hz"],
@@ -2560,7 +2623,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 target_sample_rate_hz=info_payload["target_sample_rate_hz"],
             )
         except Exception:
-            logger.debug("Failed to log OpenAI session assumptions", exc_info=True)
+            logger.debug("Failed to log Grok session assumptions", exc_info=True)
 
     def _handle_session_info_event(self, event: Dict[str, Any]) -> None:
         call_id = self._call_id
@@ -2575,7 +2638,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         if provider_rate:
             self._provider_reported_output_rate = provider_rate
             try:
-                _OPENAI_PROVIDER_OUTPUT_RATE.set(provider_rate)
+                _GROK_PROVIDER_OUTPUT_RATE.set(provider_rate)
             except Exception:
                 pass
             try:
@@ -2609,20 +2672,20 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         }
 
         try:
-            _OPENAI_SESSION_AUDIO_INFO.info(info_payload)
+            _GROK_SESSION_AUDIO_INFO.info(info_payload)
         except Exception:
             pass
 
         try:
             logger.info(
-                "OpenAI Realtime session acknowledged audio format",
+                "Grok session acknowledged audio format",
                 call_id=call_id,
                 provider_output_encoding=provider_encoding,
                 provider_output_sample_rate_hz=provider_rate,
                 event_type=event.get("type"),
             )
         except Exception:
-            logger.debug("Failed to log OpenAI session metadata", exc_info=True)
+            logger.debug("Failed to log Grok session metadata", exc_info=True)
 
     def _update_output_meter(self, chunk_bytes: int) -> None:
         if not chunk_bytes or not self._call_id:
@@ -2651,7 +2714,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         confirmed_pcm = bool(self._outfmt_acknowledged and self._provider_output_format == "pcm16")
 
         try:
-            _OPENAI_MEASURED_OUTPUT_RATE.set(measured_rate)
+            _GROK_MEASURED_OUTPUT_RATE.set(measured_rate)
         except Exception:
             pass
 
@@ -2662,7 +2725,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         except Exception:
             assumed_now = float(getattr(self.config, "output_sample_rate_hz", 0) or 0)
         # CRITICAL FIX: Never adjust sample rate based on measured_rate for streaming audio
-        # OpenAI sends PCM16@24kHz at playback speed (real-time), not processing speed.
+        # Grok sends audio at playback speed (real-time), not processing speed.
         # Measuring bytes/time gives playback rate (~1-3 kHz), NOT sample rate (24kHz).
         # Always keep the configured sample rate (24000 Hz) for accurate resampling.
         if elapsed >= 0.25 and assumed_now > 0:
@@ -2674,7 +2737,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 self._output_rate_warned = True
                 # Log the drift for diagnostics but DO NOT change _active_output_sample_rate_hz
                 logger.debug(
-                    "OpenAI output rate drift detected (expected for real-time streaming)",
+                    "Grok output rate drift detected (expected for real-time streaming)",
                     call_id=self._call_id,
                     measured_rate_hz=round(measured_rate, 2),
                     configured_rate_hz=assumed_now,
@@ -2695,11 +2758,11 @@ class OpenAIRealtimeProvider(AIProviderInterface):
             }
             try:
                 logger.info(
-                    "OpenAI Realtime output rate check",
+                    "Grok output rate check",
                     **{k: v for k, v in log_payload.items() if v is not None},
                 )
             except Exception:
-                logger.debug("Failed to log OpenAI output rate check", exc_info=True)
+                logger.debug("Failed to log Grok output rate check", exc_info=True)
 
             # CRITICAL FIX: Same as above - do not adjust rate based on measured_rate
             # Keep this section for logging only, never modify _active_output_sample_rate_hz
@@ -2709,7 +2772,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 if drift > 0.10:
                     try:
                         logger.debug(
-                            "OpenAI output rate drift info (streaming timing, not sample rate error)",
+                            "Grok output rate drift info (streaming timing, not sample rate error)",
                             call_id=self._call_id,
                             measured_streaming_rate_hz=round(measured_rate, 2),
                             configured_sample_rate_hz=assumed,
@@ -2718,7 +2781,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                             note="This is expected for real-time streaming. Sample rate remains fixed.",
                         )
                     except Exception:
-                        logger.debug("Failed to log OpenAI output rate info", exc_info=True)
+                        logger.debug("Failed to log Grok output rate info", exc_info=True)
 
             # Fallback trigger: if stream has been running >10s and measured rate remains <7.6–8 kHz, switch to PCM16@24k.
             # Guardrail: when the server has ACKed G.711 (μ-law/a-law) output, this heuristic is unreliable because
@@ -2746,16 +2809,16 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         self._pacer_running = True
         self._pacer_start_ts = time.monotonic()
         
-        # CRITICAL: Clear OpenAI's input audio buffer when we start outputting
+        # CRITICAL: Clear Grok's input audio buffer when we start outputting
         # This prevents echo from being processed - any audio buffered before
-        # our local gating kicked in will be discarded by OpenAI
+        # our local gating kicked in will be discarded by Grok
         try:
             clear_buffer_payload = {
                 "type": "input_audio_buffer.clear",
                 "event_id": f"clear-echo-{uuid.uuid4()}",
             }
             await self._send_json(clear_buffer_payload)
-            logger.debug("🔇 Cleared OpenAI input buffer for echo prevention", call_id=self._call_id)
+            logger.debug("🔇 Cleared Grok input buffer for echo prevention", call_id=self._call_id)
         except Exception:
             logger.debug("Failed to clear input buffer", call_id=self._call_id, exc_info=True)
         
@@ -2813,7 +2876,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                     if not self._first_output_chunk_logged:
                         try:
                             logger.info(
-                                "OpenAI Realtime first paced audio chunk",
+                                "Grok first paced audio chunk",
                                 call_id=call_id,
                                 bytes=len(chunk),
                                 target_encoding=self.config.target_encoding,
@@ -2868,7 +2931,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
         call_id = self._call_id
         try:
             logger.warning(
-                "Switching OpenAI output to PCM16@24k due to sustained low measured rate",
+                "Switching Grok output to PCM16@24k due to sustained low measured rate",
                 call_id=call_id,
             )
         except Exception:
@@ -2892,7 +2955,7 @@ class OpenAIRealtimeProvider(AIProviderInterface):
                 self._active_output_sample_rate_hz = 24000.0
             self._reset_output_meter()
         except Exception:
-            logger.debug("Failed to switch OpenAI session to PCM16@24k", call_id=call_id, exc_info=True)
+            logger.debug("Failed to switch Grok session to PCM16@24k", call_id=call_id, exc_info=True)
 
     @staticmethod
     def _extract_sample_rate(fmt: Any) -> Optional[int]:

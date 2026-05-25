@@ -13,6 +13,7 @@ import ssl
 import smtplib
 from email.message import EmailMessage
 from contextlib import contextmanager
+from pathlib import Path
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, Union
 from urllib.parse import urlparse
@@ -82,6 +83,7 @@ def _ai_engine_env_key(key: str) -> bool:
             "RESEND_API_KEY",
             "ELEVENLABS_API_KEY",
             "ELEVENLABS_AGENT_ID",
+            "XAI_API_KEY",  # xAI Grok Voice Agent (legacy single-instance fallback)
             "TZ",
             "STREAMING_LOG_LEVEL",
         )
@@ -478,6 +480,7 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
     try:
         from pydantic import ValidationError
         from src.config import AppConfig, load_config
+        from src.config.provider_instances import validate_provider_instances
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -485,6 +488,11 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
         )
 
     warnings: list[str] = []
+
+    try:
+        validate_provider_instances(parsed)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # Warn if user put credentials in YAML (they will be ignored by design).
     try:
@@ -554,13 +562,18 @@ async def update_yaml_config(update: ConfigUpdate):
         validation = _validate_ai_agent_config(update.content)
         warnings = validation.get("warnings") or []
 
-        # Snapshot current merged config for hot-reload comparison
-        old_merged = _read_merged_config_dict()
-
         # Parse desired merged config content from UI.
         new_parsed = _safe_load_no_duplicates(update.content) or {}
         if not isinstance(new_parsed, dict):
             raise HTTPException(status_code=400, detail="Config YAML must be a mapping at the top level")
+
+        if _migrate_inline_provider_secrets(new_parsed):
+            update.content = yaml.dump(new_parsed, default_flow_style=False, sort_keys=False)
+            validation = _validate_ai_agent_config(update.content)
+            warnings = validation.get("warnings") or warnings
+
+        # Snapshot current merged config for hot-reload comparison
+        old_merged = _read_merged_config_dict()
 
         # Convert desired merged config into a minimal local override (supports deletions).
         base = _read_base_config_dict()
@@ -1928,6 +1941,502 @@ async def get_provider_options(provider_type: str):
 
 # Store in project secrets dir - Admin UI has write access, ai_engine mounts it
 VERTEX_CREDENTIALS_PATH = "/app/project/secrets/gcp-service-account.json"
+PROVIDER_SECRETS_ROOT = "/app/project/secrets/providers"
+
+
+def _provider_instances_module():
+    project_root = getattr(settings, "PROJECT_ROOT", None)
+    if project_root and project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from src.config.provider_instances import (
+        API_KEY_COMPATIBLE_KINDS,
+        CREDENTIAL_NAME_TO_FIELD,
+        FULL_AGENT_KINDS,
+        ProviderInstanceError,
+        provider_kind,
+        resolve_secret_value,
+        safe_secret_path,
+        validate_provider_key,
+        write_secret_file_bytes,
+    )
+    return {
+        "api_key_kinds": API_KEY_COMPATIBLE_KINDS,
+        "credential_fields": CREDENTIAL_NAME_TO_FIELD,
+        "full_agent_kinds": FULL_AGENT_KINDS,
+        "ProviderInstanceError": ProviderInstanceError,
+        "provider_kind": provider_kind,
+        "resolve_secret_value": resolve_secret_value,
+        "safe_secret_path": safe_secret_path,
+        "validate_provider_key": validate_provider_key,
+        "write_secret_file_bytes": write_secret_file_bytes,
+    }
+
+
+def _get_provider_block(provider_key: str) -> tuple[Dict[str, Any], Dict[str, Any], str]:
+    helpers = _provider_instances_module()
+    try:
+        helpers["validate_provider_key"](provider_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    merged = _read_merged_config_dict()
+    providers = merged.get("providers") if isinstance(merged.get("providers"), dict) else {}
+    provider_cfg = providers.get(provider_key)
+    if not isinstance(provider_cfg, dict):
+        raise HTTPException(status_code=404, detail=f"Provider '{provider_key}' not found")
+    kind = helpers["provider_kind"](provider_key, provider_cfg)
+    if kind not in helpers["full_agent_kinds"]:
+        raise HTTPException(status_code=400, detail=f"Provider '{provider_key}' is not a full-agent provider")
+    return merged, provider_cfg, kind
+
+
+def _provider_secret_path(provider_key: str, credential_name: str) -> str:
+    """Build a secrets-root-bounded path for a per-provider credential file.
+
+    Delegates to :func:`src.config.provider_instances.safe_secret_path`
+    which (a) re-validates ``provider_key`` against the strict allowlist
+    and (b) re-checks that the realpath stays inside
+    :data:`PROVIDER_SECRETS_ROOT`. CodeQL flags string interpolation of
+    request data into file paths, even when the input has already been
+    sanitized — routing every call through the central helper makes the
+    validation local to every filesystem operation and removes the
+    finding.
+    """
+    filename_map = {
+        "api-key": "api-key",
+        "agent-id": "agent-id",
+        "vertex-json": "vertex-service-account.json",
+    }
+    if credential_name not in filename_map:
+        raise HTTPException(status_code=400, detail="credential_name must be one of: api-key, agent-id, vertex-json")
+    helpers = _provider_instances_module()
+    try:
+        return helpers["safe_secret_path"](
+            provider_key,
+            filename_map[credential_name],
+            root=PROVIDER_SECRETS_ROOT,
+        )
+    except helpers["ProviderInstanceError"] as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _credential_allowed_for_kind(kind: str, credential_name: str) -> bool:
+    helpers = _provider_instances_module()
+    if credential_name == "api-key":
+        return kind in helpers["api_key_kinds"]
+    if credential_name == "agent-id":
+        return kind == "elevenlabs_agent"
+    if credential_name == "vertex-json":
+        return kind == "google_live"
+    return False
+
+
+def _write_provider_secret(provider_key: str, credential_name: str, content: bytes) -> None:
+    """Atomically write a per-instance provider credential to disk.
+
+    Sinks take ``(provider_key, credential_name)`` rather than a path
+    string so the only request-derived value entering the filesystem
+    operation is the strictly-validated provider key (regex
+    ``[A-Za-z0-9_.-]{1,64}``). The path is constructed locally from
+    that validated key plus a constant filename lookup, eliminating
+    the cross-function taint flow that CodeQL's CWE-022 query could
+    not see through (PR #396 — replaces alerts 1704–1726 with a
+    refactor instead of mid-flow sanitizers).
+
+    Storing credentials in chmod-600 files under
+    :data:`PROVIDER_SECRETS_ROOT` is the intentional design (see
+    :doc:`docs/Multi-Instance-Full-Agent-Providers`): runtime providers
+    need to read them to make API calls, and the env-vars-only
+    alternative does not scale to multi-tenant deployments.
+
+    Atomic write via per-writer unique ``.tmp`` sibling + ``os.replace``.
+    The temp file is created with mode 0o600, so it is owner-only readable
+    before content is written and before the rename.
+    """
+    import uuid
+
+    helpers = _provider_instances_module()
+    try:
+        target_str = helpers["safe_secret_path"](
+            provider_key,
+            _credential_filename(credential_name),
+            root=PROVIDER_SECRETS_ROOT,
+        )
+    except helpers["ProviderInstanceError"] as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    target = Path(target_str)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Per-writer unique temp filename so two concurrent uploads /
+    # migrations to the same credential can't clobber each other's
+    # ``.tmp`` mid-write or race on ``os.replace`` (CodeRabbit on
+    # PR #396).
+    temp_path = target.with_name(
+        f"{target.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    )
+    try:
+        # nosec B306: writing the credential to a chmod-600 file under
+        # the secrets root is the intended storage layer for
+        # per-instance API keys; see docstring above.
+        helpers["write_secret_file_bytes"](str(temp_path), content)
+        os.replace(temp_path, target)
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+
+
+_CREDENTIAL_FILENAME_MAP = {
+    "api-key": "api-key",
+    "agent-id": "agent-id",
+    "vertex-json": "vertex-service-account.json",
+}
+
+
+def _credential_filename(credential_name: str) -> str:
+    """Resolve credential_name → on-disk filename via the static map.
+
+    Raises HTTPException 400 if the credential_name is not one of the
+    three allowlist values. The output is a constant string from the
+    map — never request-derived — so any path constructed downstream
+    has only validated provider_key + constant filename inputs.
+    """
+    fname = _CREDENTIAL_FILENAME_MAP.get(credential_name)
+    if fname is None:
+        raise HTTPException(
+            status_code=400,
+            detail="credential_name must be one of: api-key, agent-id, vertex-json",
+        )
+    return fname
+
+
+def _save_merged_config(merged_config: Dict[str, Any]) -> None:
+    base_config = _read_base_config_dict()
+    merged_content = yaml.dump(merged_config, default_flow_style=False, sort_keys=False)
+    _validate_ai_agent_config(merged_content)
+    local_override = _compute_local_override(base_config, merged_config)
+    content = yaml.dump(local_override or {}, default_flow_style=False, sort_keys=False)
+    _write_local_config(content)
+
+
+def _update_provider_credentials_field(provider_key: str, field: str, value: Optional[str]) -> None:
+    merged, provider_cfg, _kind = _get_provider_block(provider_key)
+    providers = merged.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    if value:
+        provider_cfg[field] = value
+    else:
+        provider_cfg.pop(field, None)
+    providers[provider_key] = provider_cfg
+    merged["providers"] = providers
+    _save_merged_config(merged)
+
+
+def _migrate_inline_provider_secrets(config_data: Dict[str, Any]) -> bool:
+    """Move inline Admin UI secrets into provider-scoped secret files."""
+    helpers = _provider_instances_module()
+    providers = config_data.get("providers") if isinstance(config_data.get("providers"), dict) else {}
+    changed = False
+    for provider_key, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        kind = helpers["provider_kind"](provider_key, provider_cfg)
+        for inline_field, credential_name, file_field in (
+            ("api_key", "api-key", "api_key_file"),
+            ("agent_id", "agent-id", "agent_id_file"),
+        ):
+            value = provider_cfg.get(inline_field)
+            if not isinstance(value, str) or not value.strip() or value.strip().startswith("${"):
+                continue
+            if not _credential_allowed_for_kind(kind, credential_name):
+                continue
+            path = _provider_secret_path(str(provider_key), credential_name)
+            _write_provider_secret(str(provider_key), credential_name, value.strip().encode("utf-8"))
+            provider_cfg[file_field] = path
+            provider_cfg.pop(inline_field, None)
+            changed = True
+    return changed
+
+
+def _credential_metadata(provider_key: str, credential_name: str) -> Dict[str, Any]:
+    """Stat + optional JSON-parse a per-instance credential file.
+
+    Takes ``(provider_key, credential_name)`` so the path is constructed
+    locally from the validated key + constant filename map — same
+    no-taint-flow shape as ``_write_provider_secret`` (CodeQL CWE-022
+    elimination via refactor, not mid-flow sanitizer).
+    """
+    helpers = _provider_instances_module()
+    try:
+        target_str = helpers["safe_secret_path"](
+            provider_key,
+            _credential_filename(credential_name),
+            root=PROVIDER_SECRETS_ROOT,
+        )
+    except helpers["ProviderInstanceError"] as exc:
+        return {"uploaded": False, "error": str(exc)}
+
+    target = Path(target_str)
+    if not target.exists():
+        return {"uploaded": False, "path": str(target)}
+    stat = target.stat()
+    meta: Dict[str, Any] = {
+        "uploaded": True,
+        "path": str(target),
+        "uploaded_at": stat.st_mtime,
+    }
+    if credential_name == "vertex-json":
+        try:
+            import json
+
+            with open(target, "r") as f:
+                creds = json.load(f)
+            meta.update(
+                {
+                    "project_id": creds.get("project_id"),
+                    "client_email": creds.get("client_email"),
+                }
+            )
+        except Exception:
+            meta["error"] = "Failed to read credentials metadata"
+    return meta
+
+
+@router.get("/providers/{provider_key}/credentials")
+async def get_provider_credentials_status(provider_key: str):
+    merged, provider_cfg, kind = _get_provider_block(provider_key)
+    helpers = _provider_instances_module()
+    fields = helpers["credential_fields"]
+    credentials: Dict[str, Any] = {}
+    for credential_name, field in fields.items():
+        if not _credential_allowed_for_kind(kind, credential_name):
+            continue
+        credentials[credential_name] = _credential_metadata(provider_key, credential_name)
+        credentials[credential_name]["configured"] = bool(provider_cfg.get(field))
+    return {
+        "provider_key": provider_key,
+        "type": kind,
+        "credentials": credentials,
+    }
+
+
+@router.post("/providers/{provider_key}/credentials/api-key")
+async def upload_provider_api_key(provider_key: str, payload: Dict[str, Any]):
+    _merged, _provider_cfg, kind = _get_provider_block(provider_key)
+    if not _credential_allowed_for_kind(kind, "api-key"):
+        raise HTTPException(status_code=400, detail=f"api-key is not valid for provider type '{kind}'")
+    api_key = str(payload.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    path = _provider_secret_path(provider_key, "api-key")
+    _write_provider_secret(provider_key, "api-key", api_key.encode("utf-8"))
+    _update_provider_credentials_field(provider_key, "api_key_file", path)
+    return {"status": "success", "restart_pending": True, "path": path}
+
+
+@router.post("/providers/{provider_key}/credentials/agent-id")
+async def upload_provider_agent_id(provider_key: str, payload: Dict[str, Any]):
+    _merged, _provider_cfg, kind = _get_provider_block(provider_key)
+    if not _credential_allowed_for_kind(kind, "agent-id"):
+        raise HTTPException(status_code=400, detail=f"agent-id is not valid for provider type '{kind}'")
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="agent_id is required")
+    path = _provider_secret_path(provider_key, "agent-id")
+    _write_provider_secret(provider_key, "agent-id", agent_id.encode("utf-8"))
+    _update_provider_credentials_field(provider_key, "agent_id_file", path)
+    return {"status": "success", "restart_pending": True, "path": path}
+
+
+@router.post("/providers/{provider_key}/credentials/vertex-json")
+async def upload_provider_vertex_json(provider_key: str, file: UploadFile = File(...)):
+    import json
+
+    _merged, _provider_cfg, kind = _get_provider_block(provider_key)
+    if not _credential_allowed_for_kind(kind, "vertex-json"):
+        raise HTTPException(status_code=400, detail=f"vertex-json is not valid for provider type '{kind}'")
+    if not file.filename or not file.filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="File must be a JSON file")
+    try:
+        content = await file.read()
+        creds = json.loads(content)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON file")
+    required_fields = ["type", "project_id", "private_key", "client_email"]
+    missing = [field for field in required_fields if field not in creds]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Invalid service account JSON. Missing fields: {', '.join(missing)}")
+    if creds.get("type") != "service_account":
+        raise HTTPException(status_code=400, detail="JSON file must be a service account key (type: service_account)")
+    path = _provider_secret_path(provider_key, "vertex-json")
+    _write_provider_secret(provider_key, "vertex-json", content)
+    _update_provider_credentials_field(provider_key, "credentials_path", path)
+    return {
+        "status": "success",
+        "restart_pending": True,
+        "path": path,
+        "project_id": creds.get("project_id"),
+        "client_email": creds.get("client_email"),
+    }
+
+
+@router.delete("/providers/{provider_key}/credentials/{credential_name}")
+async def delete_provider_credential(provider_key: str, credential_name: str):
+    helpers = _provider_instances_module()
+    fields = helpers["credential_fields"]
+    if credential_name not in fields:
+        raise HTTPException(status_code=400, detail="credential_name must be one of: api-key, agent-id, vertex-json")
+    merged, provider_cfg, kind = _get_provider_block(provider_key)
+    if not _credential_allowed_for_kind(kind, credential_name):
+        raise HTTPException(status_code=400, detail=f"{credential_name} is not valid for provider type '{kind}'")
+    field = fields[credential_name]
+    path = str(provider_cfg.get(field) or _provider_secret_path(provider_key, credential_name))
+    providers = merged.get("providers") if isinstance(merged.get("providers"), dict) else {}
+    references = [
+        name
+        for name, cfg in providers.items()
+        if isinstance(cfg, dict) and str(cfg.get(field) or "") == path
+    ]
+    if references and references != [provider_key]:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Credential file is referenced by other providers", "references": references},
+        )
+    provider_cfg.pop(field, None)
+    providers[provider_key] = provider_cfg
+    merged["providers"] = providers
+    _save_merged_config(merged)
+    # Compute the on-disk path locally from (provider_key,
+    # credential_name) so the unlink target is constructed from
+    # validated inputs only — same no-taint shape as
+    # _write_provider_secret / _credential_metadata.
+    try:
+        canonical_str = helpers["safe_secret_path"](
+            provider_key,
+            _credential_filename(credential_name),
+            root=PROVIDER_SECRETS_ROOT,
+        )
+    except helpers["ProviderInstanceError"]:
+        # Defensive: provider_key just passed validation above, so this
+        # shouldn't happen in practice. If it does, the YAML field has
+        # already been popped and we just don't unlink.
+        return {"status": "success", "restart_pending": True}
+    canonical = Path(canonical_str)
+    if canonical.exists():
+        canonical.unlink()
+    return {"status": "success", "restart_pending": True}
+
+
+@router.post("/providers/{provider_key}/credentials/verify")
+async def verify_provider_credentials(provider_key: str):
+    import httpx
+
+    _merged, provider_cfg, kind = _get_provider_block(provider_key)
+    helpers = _provider_instances_module()
+    api_key = helpers["resolve_secret_value"](
+        provider_cfg,
+        file_field="api_key_file",
+        env_field="api_key_env",
+        inline_field="api_key",
+        legacy_env_names=(
+            ("OPENAI_API_KEY",)
+            if kind == "openai_realtime"
+            else ("DEEPGRAM_API_KEY",)
+            if kind == "deepgram"
+            else ("GOOGLE_API_KEY",)
+            if kind == "google_live"
+            else ("ELEVENLABS_API_KEY",)
+            if kind == "elevenlabs_agent"
+            else ("XAI_API_KEY",)
+            if kind == "grok"
+            else ()
+        ),
+    )
+    try:
+        if kind == "google_live" and provider_cfg.get("credentials_path"):
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request
+
+            def _refresh_credentials():
+                creds = service_account.Credentials.from_service_account_file(
+                    provider_cfg["credentials_path"],
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                creds.refresh(Request())
+                return creds
+
+            credentials = await asyncio.to_thread(_refresh_credentials)
+            return {
+                "status": "success",
+                "message": "Vertex credentials verified successfully",
+                "token_expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+            }
+        if kind == "openai_realtime":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="OpenAI API key is not configured")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="OpenAI API key verification failed")
+            return {"status": "success", "message": "OpenAI API key verified"}
+        if kind == "deepgram":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Deepgram API key is not configured")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://api.deepgram.com/v1/projects", headers={"Authorization": f"Token {api_key}"})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="Deepgram API key verification failed")
+            return {"status": "success", "message": "Deepgram API key verified"}
+        if kind == "google_live":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Google API key or Vertex credentials are not configured")
+            # Pass the API key via httpx `params=` rather than f-string
+            # interpolation. The hostname is hardcoded, so this isn't an
+            # SSRF risk in practice, but the f-string trips CodeQL's
+            # partial-SSRF rule (alert ID 1715) because the interpolated
+            # value crosses the URL boundary; httpx handles encoding
+            # cleanly and the request stays on the intended host.
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": api_key},
+                )
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="Google API key verification failed")
+            return {"status": "success", "message": "Google Developer API key verified"}
+        if kind == "elevenlabs_agent":
+            agent_id = helpers["resolve_secret_value"](
+                provider_cfg,
+                file_field="agent_id_file",
+                env_field="agent_id_env",
+                inline_field="agent_id",
+                legacy_env_names=("ELEVENLABS_AGENT_ID",),
+            )
+            if not api_key or not agent_id:
+                raise HTTPException(status_code=400, detail="ElevenLabs API key and agent_id are required")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": api_key})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="ElevenLabs API key verification failed")
+            return {"status": "success", "message": "ElevenLabs credentials verified"}
+        if kind == "grok":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="xAI API key is not configured")
+            # xAI exposes an OpenAI-compatible /v1/models endpoint for credential check.
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://api.x.ai/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="xAI API key verification failed")
+            return {"status": "success", "message": "xAI API key verified"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error verifying provider credentials: {exc}")
+        raise HTTPException(status_code=400, detail=f"Verification failed: {exc}")
+    raise HTTPException(status_code=400, detail=f"Unsupported provider type '{kind}'")
 VERTEX_REGIONS = [
     {"value": "us-central1", "label": "US Central (Iowa)"},
     {"value": "us-east1", "label": "US East (South Carolina)"},
@@ -2190,6 +2699,7 @@ def _read_google_calendar_entry(key: str) -> dict:
 
 
 _ALLOWED_CREDENTIALS_DIRS = (
+    "/app/project/secrets/providers",
     "/app/project/secrets",
     "/app/secrets",
     "/secrets",
@@ -3300,6 +3810,12 @@ def _ms_device_flow_worker(flow_id: str, tenant_id: str, client_id: str, account
                 }
             return
         _persist_ms_token_cache(cache, account_key)
+        # Capture the canonical cache path for the success payload. The
+        # caller surfaces this in /devices/poll so the UI can show where
+        # the token cache landed. Was referenced at the result-dict
+        # assembly below but never defined in this scope — CodeRabbit
+        # critical on PR #396.
+        token_cache_path = _ms_token_cache_path_for_key(account_key)
         access_token = result["access_token"]
         me = _ms_graph_request_with_token(access_token, "GET", "/me")
         # Paginate /me/calendars. Without this, accounts with many calendars
