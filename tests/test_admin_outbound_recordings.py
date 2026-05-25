@@ -1,4 +1,12 @@
+import importlib.util
+
 import pytest
+
+# admin_ui backend imports fastapi at module load. Skip the whole module on
+# environments that don't have it (CI's engine-only jobs run without admin_ui
+# deps), matching tests/test_admin_call_recordings.py.
+if importlib.util.find_spec("fastapi") is None:
+    pytest.skip("fastapi not installed; admin_ui outbound tests skipped", allow_module_level=True)
 
 from admin_ui.backend.api import outbound
 
